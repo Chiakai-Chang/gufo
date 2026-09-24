@@ -14,10 +14,35 @@ results and qualification gaps live in:
 
 `tools/bench/model-bench.py` measures the tables of a model's `BENCHMARKS.md`
 over HTTP for Gufo and for the reference project of its category (llama.cpp
-for GGUF language models), writes per-table artifacts, and renders the tables
+for Qwen; antirez/ds4 for DeepSeek), writes per-table artifacts, and renders the tables
 and SVG charts between the `<!-- bench:<id> -->` markers. Workloads and table
 layouts are declared in `docs/models/<model>/artifacts/bench.json`; the
 `benchmark-model` skill in `.agents/skills` describes the procedure.
+
+Reference runtimes are explicitly selected Nix packages, excluded from Gufo,
+the normal development shell and hosted checks:
+
+| Reference | Package | Executable |
+| --- | --- | --- |
+| Qwen AR / DFlash2 | `.#llama-cpp-reference` | `llama-server` |
+| Flash-Next MTP | `.#llama-cpp-mtp-reference` | `llama-server-mtp` |
+| DeepSeek AR / DSpark | `.#ds4-reference` | `ds4-server`, `ds4-bench` |
+
+For example, enter the development shell and add only the needed baseline:
+
+```sh
+nix develop
+nix shell .#llama-cpp-reference .#llama-cpp-mtp-reference
+python3 tools/bench/model-bench.py --model qwen3.8-flash-next --gguf "$MODEL" \
+  --mtp "$MTP" run --target reference --table single-mtp
+```
+
+DeepSeek's HTTP payload omits pp/tg durations. The driver reads the pinned
+server's existing stage timers from its log and checks them against HTTP token
+counts. Native `ds4-bench` also supports single-session AR/DSpark, but not
+concurrency. The pinned ROCm server disables DSpark when batching, so C>1
+DSpark comparisons are **N/A**. See the
+[DS4 method](models/deepseek-v4-flash/EVALUATION.md#benchmark-method).
 
 New or refreshed text-model cards use the same pp2048 prose/copying prompts
 for single-user d0 and concurrency, with tg128. The driver shares their prompt
@@ -48,8 +73,9 @@ when prompt, cache state, sampling, speculation, and timed scope match.
 
 Model tables report the **sum of individual request decode rates** in each
 concurrent group, averaged across measured groups. Prefill and queue time
-remain in the latency diagnostics. Missing decode timings are **TODO**;
-whole-request throughput is not a substitute.
+remain in the latency diagnostics. Pending measurements are **TODO**;
+comparisons prevented by missing reference features are **N/A**, with a reason.
+Whole-request throughput is not a substitute for decode timings.
 
 `--endpoint-profile openai` supports other OpenAI-compatible servers. Missing
 server-stage metrics remain null. `--reference-report` compares completion

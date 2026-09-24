@@ -10,6 +10,7 @@ import json
 import struct
 import zlib
 import random
+import shutil
 import statistics
 import subprocess
 import threading
@@ -99,6 +100,15 @@ class Session:
     def cache_prompt(self) -> bool | None:
         return None if self.target == "gufo" else True
 
+    @property
+    def reference_kind(self) -> str:
+        return self.config.data["reference"].get("kind", "llama.cpp")
+
+    @property
+    def request_model(self) -> str:
+        # The upstream alias disables default DeepSeek thinking for corpus requests too.
+        return "deepseek-chat" if self.target == "reference" and self.reference_kind == "ds4" else MODEL_ALIAS
+
     # ----- server commands -------------------------------------------------
 
     def gufo_command(self, table: TableSpec, *, mode: str | None, context: int, sessions: int, port: int) -> list[str]:
@@ -126,8 +136,19 @@ class Session:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
         args = list(cfg.data["reference"]["args"])
-        command = [self.reference_binary_for(mode), "-m", str(gguf), "-c", str(context), "-np", str(parallel),
-                   "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS, *args]
+        if self.reference_kind == "ds4":
+            if parallel > 1 and mode and mode != "ar":
+                raise RuntimeError("the pinned ds4 ROCm server disables DSpark in native session batching")
+            # The caller supplies total reference context; ds4 allocates per session.
+            command = [self.reference_binary_for(mode), "--model", str(gguf),
+                       "--ctx", str(context // parallel),
+                       "--port", str(port), "--host", "127.0.0.1", *args]
+            # Even --batched-session 1 disables DSpark in this upstream pin.
+            if parallel > 1:
+                command += ["--batched-session", str(parallel)]
+        else:
+            command = [self.reference_binary_for(mode), "-m", str(gguf), "-c", str(context), "-np", str(parallel),
+                       "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS, *args]
         if table.kind == "image-encoder":
             command += ["--mmproj", str(cfg.file("mmproj", table.variant))]
         if mode and mode != "ar":
@@ -145,7 +166,14 @@ class Session:
             command = self.gufo_command(table, mode=mode, context=context, sessions=sessions, port=placeholder.port)
         else:
             command = self.reference_command(table, mode=mode, context=context, parallel=sessions, port=placeholder.port)
+            if shutil.which(command[0]) is None:
+                raise RuntimeError(
+                    f"{command[0]} not on PATH; select its optional Nix reference package "
+                    "(see docs/BENCHMARKS.md)"
+                )
+            self.reference_version(mode)
         placeholder.command = command
+        self.active_log = log
         return placeholder
 
     def reference_version(self, mode: str | None = None) -> str | None:
@@ -154,6 +182,14 @@ class Session:
         binary = self.reference_binary_for(mode)
         cache = self.__dict__.setdefault("_reference_versions", {})
         if binary not in cache:
+            if self.reference_kind == "ds4":
+                executable = Path(shutil.which(binary) or binary).resolve()
+                revision = (executable.parent.parent / "share" / "ds4-revision").read_text().strip()
+                expected = self.config.data["reference"]["revision"]
+                if revision != expected:
+                    raise RuntimeError(f"ds4 reference revision {revision} differs from configured {expected}")
+                cache[binary] = f"ds4 {revision}"
+                return cache[binary]
             completed = subprocess.run([binary, "--version"], capture_output=True, text=True)
             lines = (completed.stdout + completed.stderr).splitlines()
             versions = [line.strip() for line in lines if line.strip().startswith("version:")]
@@ -176,20 +212,32 @@ class Session:
                 messages: list[dict[str, Any]] | None = None,
                 cache_prompt: bool | None = "default",  # type: ignore[assignment]
                 extra_body: dict[str, Any] | None = None) -> RequestObservation:
-        return run_request(
-            base_url=base_url, model=MODEL_ALIAS, prompt=prompt, max_tokens=max_tokens,
+        if self.target == "reference" and self.reference_kind == "ds4":
+            extra_body = {"thinking": {"type": "disabled"}, **(extra_body or {})}
+        use_log = self.target == "reference" and self.reference_kind == "ds4"
+        offset = self.active_log.stat().st_size if use_log else 0
+        sample = run_request(
+            base_url=base_url, model=self.request_model, prompt=prompt, max_tokens=max_tokens,
             temperature=float(self.config.data["sampling"]["temperature"]),
             timeout_seconds=REQUEST_TIMEOUT, client_id=CLIENT_ID, concurrency=1,
             repetition=1, request_index=index, endpoint_profile=self.profile,
             cache_prompt=self.cache_prompt if cache_prompt == "default" else cache_prompt, messages=messages,
             extra_body=extra_body,
         )
+        if use_log:
+            from ds4.server_metrics import request_metrics
+            with self.active_log.open("rb") as log:
+                log.seek(offset)
+                sample = request_metrics(log.read().decode(), sample)
+        return sample
 
     def chat_text(self, base_url: str, messages: list[dict[str, str]], max_tokens: int,
                   extra_body: dict[str, Any] | None = None) -> str:
         """Non-streaming completion text, used to build a reusable conversation prefix."""
-        payload = {"model": MODEL_ALIAS, "messages": messages, "max_tokens": max_tokens,
+        payload = {"model": self.request_model, "messages": messages, "max_tokens": max_tokens,
                    "temperature": float(self.config.data["sampling"]["temperature"]), "stream": False}
+        if self.target == "reference" and self.reference_kind == "ds4":
+            payload["thinking"] = {"type": "disabled"}
         if self.cache_prompt is not None:
             payload["cache_prompt"] = self.cache_prompt
         if extra_body:
@@ -358,12 +406,13 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
             tgs: list[float] = []
             accepts: list[float] = []
             counts: list[dict[str, Any]] = []
+            task = spec.get("depth_workloads", {}).get(str(depth), spec.get("workload", "prose"))
             try:
                 observations = [
                     _measure_depth(session, server.base_url, tokenizer, depth=depth,
                                    prompt_tokens=prompt_tokens, output_tokens=output_tokens,
                                    fraction=fraction, seed=base_seed, repetition=repetition,
-                                   task=spec.get("workload", "prose"))
+                                   task=task)
                     for repetition in range(repetitions)
                 ]
             except (RuntimeError, OSError) as failure:  # OSError: server died mid-request
@@ -400,7 +449,7 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
                                "draft_n": observation.draft_tokens,
                                "draft_n_accepted": accepted,
                                "completion_sha256": observation.completion_sha256})
-            row: dict[str, Any] = {"counts": counts, "samples": repetitions,
+            row: dict[str, Any] = {"counts": counts, "samples": repetitions, "workload": task,
                                    "command": " ".join(public_command(server.command))}
             for name, values in (("pp", pps), ("tg", tgs), ("acceptance", accepts), ("accepted_per_step", per_step)):
                 if values:
@@ -412,7 +461,7 @@ def run_single(session: Session, table: TableSpec, display_table: TableSpec | No
     wait_process_exit(server)
     artifact = session.artifact(table, mode=(mode if table.speculative else None), command=server.command, notes=[
         f"pp{prompt_tokens}/tg{output_tokens}; depth is a cached conversation prefix of synthetic text "
-        f"({PREFIX_REPLY_TOKENS}-token reply); measured turn task: {spec.get('workload', 'prose')}; "
+        f"({PREFIX_REPLY_TOKENS}-token reply); measured turn task is recorded per row; "
         f"tolerance max(32, {fraction:.3%}) on cache_n and prompt_n; actual counts per sample in rows",
         f"synthetic text: {tokenizer.ratio:.3f} tokens/word, template overhead {tokenizer.overhead} tokens",
         *[f"not measured, {failure}" for failure in failures],
@@ -434,6 +483,12 @@ TASKS = {
               "Write at least 500 words."),
     # Fully predictable output: the single-user analogue of the `repetition` corpus.
     "repetition": "\n\nRepeat the passage above word for word, from the beginning.",
+    "copy": ("\n\nCopy ONLY the passage in this message verbatim. Start with its first word, "
+             "preserve every word and punctuation mark, and continue until the complete "
+             "passage has been copied. Do not comment, summarize, or use ellipses."),
+    "story": ("\n\nUse the passage only as inspiration for an original story about a river town. "
+              "Do not analyze or summarize the passage. Begin the story immediately and write "
+              "at least 1000 words, with detailed scenes, dialogue, and a developing plot."),
     # Reasoning output: the generated tokens are chain-of-thought rather than prose.
     # Thinking is enabled per request so the cached prefix turn renders unchanged.
     "thinking": ("\n\nHow many distinct words appear in the passage above, and which three are "
@@ -566,8 +621,15 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         suite_bytes = json.dumps(
                             {"recipe": "single-user-d0", "task": task, "prompt": prompt},
                             sort_keys=True).encode()
+                        if (prefill_first and users > 1 and session.target == "gufo"
+                                and session.reference_kind == "ds4"):
+                            # Keep prefill arithmetic identical to the C1 control;
+                            # simultaneous cold prefills use smaller scheduler chunks.
+                            session.request(server.base_url, prompt, 1)
+                    log_offset = (server.log_path.stat().st_size
+                                  if session.target == "reference" and session.reference_kind == "ds4" else 0)
                     report = run_corpus_benchmark(
-                        base_url=server.base_url, model=MODEL_ALIAS, cases=cases,
+                        base_url=server.base_url, model=session.request_model, cases=cases,
                         workload_id=f"{cfg.model}-{table.id}-{session.target}-{mode}",
                         max_tokens=int(spec["output_tokens"]),
                         temperature=float(cfg.data["sampling"]["temperature"]),
@@ -579,12 +641,19 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                         cache_prompt=(True if prefill_first else
                                       (False if not spec.get("cache_prompt", False) else None)),
                         prefill_first=prefill_first,
-                        pin_slots=prefill_first and session.target == "reference",
+                        pin_slots=prefill_first and session.target == "reference" and session.reference_kind != "ds4",
+                        preparation_tokens=0 if session.target == "reference" and session.reference_kind == "ds4" else 1,
                         reference=reference,
                         notes=[note for note in (
                             session.reference_version(mode), " ".join(public_command(server.command)),
                             "fresh server per concurrency level") if note],
                     )
+                    if session.target == "reference" and session.reference_kind == "ds4":
+                        from ds4.server_metrics import cohort_metrics
+                        with server.log_path.open("rb") as log:
+                            log.seek(log_offset)
+                            cohort_metrics(log.read().decode(), report["results"][f"c{users}"],
+                                           int(spec["output_tokens"]))
             except (RuntimeError, OSError):
                 exit_code = server.failure_exit_code
                 wait_process_exit(server)
@@ -598,7 +667,7 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                     combined.setdefault("results", {})[f"c{remaining}"] = {"unavailable": reason}
                     print(f"{table.id} {session.target} {mode} C{remaining}: n/a, {reason}")
                 combined["modelBench"] = {"table": table.id, "target": session.target, "mode": mode,
-                                          "measuredOn": dt.date.today().isoformat()}
+                                          "measuredOn": dt.datetime.now(dt.timezone.utc).date().isoformat()}
                 save_artifact(path, combined)
                 break
             wait_process_exit(server)
@@ -620,6 +689,12 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
                     "tokensPerWord": tokenizer.ratio,
                     "promptSha256": hashlib.sha256(prompt.encode()).hexdigest(),
                 }
+                result["promptPreparation"] = (
+                    "C1 checkpoint followed by concurrent preparation"
+                    if prefill_first and users > 1 and session.target == "gufo"
+                    and session.reference_kind == "ds4"
+                    else "concurrent preparation" if prefill_first else "cold prompts"
+                )
             if combined is None or combined.get("artifactType") != report.get("artifactType"):
                 combined = report
             else:
@@ -628,7 +703,7 @@ def run_multi(session: Session, table: TableSpec, display_table: TableSpec | Non
             combined["workload"]["concurrency"] = [
                 int(key[1:]) for key in combined["results"] if key.startswith("c")]
             combined["modelBench"] = {"table": table.id, "target": session.target, "mode": mode,
-                                      "measuredOn": dt.date.today().isoformat()}
+                                      "measuredOn": dt.datetime.now(dt.timezone.utc).date().isoformat()}
             save_artifact(path, combined)
             from .render import _serving_rate
 
@@ -771,4 +846,11 @@ RUNNERS = {
 
 
 def run_table(session: Session, table: TableSpec) -> None:
+    if (session.target == "reference" and table.kind != "loading"
+            and not session.config.data["reference"].get("stage_timings", True)):
+        raise RuntimeError(
+            f"{session.config.reference_name} does not expose qualified per-request stage timings; "
+            "qualify timing and prepared-session reuse before running its throughput/memory tables. "
+            "Whole-request wall time cannot substitute for decode time."
+        )
     RUNNERS[table.kind](session, table)
