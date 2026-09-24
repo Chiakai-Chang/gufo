@@ -119,13 +119,18 @@ For example, on Debian/Ubuntu the ordinary system libraries are:
 sudo apt install build-essential cmake ninja-build pkg-config \
   libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev ffmpeg
 
+# ROCm libraries from the table, named as AMD's repository ships them.
+sudo apt install hipblas-dev hipblaslt-dev rocblas-dev \
+  hipcub-dev rocprim-dev rocwmma-dev
+
 cmake --preset release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
 cmake --build --preset release --parallel 4
 ./build/release/gufo diagnose
 ./build/release/gufo serve llm --model /path/to/model.gguf
 ```
 
-Install the ROCm dependencies from the table before configuring.
+Configuring fails at `find_package(hipblas)` when those ROCm packages are
+missing. Other distributions name them `-devel` instead of `-dev`.
 For nonstandard installations, pass ordinary CMake paths, for example
 `cmake --preset release -DCMAKE_PREFIX_PATH="/opt/rocm"`.
 If compiler discovery picks a system Clang, also pass
