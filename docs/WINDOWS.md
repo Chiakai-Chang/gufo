@@ -57,6 +57,11 @@ gufo.exe serve llm -m <first-shard>.gguf --mmproj <mmproj>.gguf ^
   - `GUFO_DUMP_PROMPT=FILE` appends each rendered prompt, for debugging.
 - **Vision**: finetuned `mmproj` files without a `general.basename` are accepted.
 - **`GUFO_ACCEPT_ANY_MODEL=1`**: requests may carry any `model` value, or none, as with llama-server.
+- **llama-server/vLLM client compatibility**:
+  - `/props` answers without `?model=` and reports `default_generation_settings.n_ctx`, `total_slots` and `modalities`;
+  - `/v1/models` carries `context_length` / `max_model_len` / `meta.n_ctx`;
+  - chat requests accept `stop` (streaming holds back a possible stop prefix and ends generation at the match), `logprobs`, `top_logprobs`, `response_format` and `modalities: ["text"]`. Fields Gufo cannot honour exactly are logged as `ignored=`.
+  - Agent clients such as Hermes probe these and use `response_format` for title generation.
 
 ## Not supported on Windows yet
 
