@@ -124,7 +124,11 @@ std::unique_ptr<NgramTable> NgramTable::Open(
         constexpr std::size_t kStep = 64ull << 20;
         for (std::size_t off = 0; off < raw->map_bytes_ && !raw->prefetch_stop_; off += kStep) {
           const std::size_t n = std::min(kStep, raw->map_bytes_ - off);
-          (void)::madvise(const_cast<std::uint8_t*>(raw->mapped_) + off, n, MADV_POPULATE_READ);
+          auto* chunk = const_cast<std::uint8_t*>(raw->mapped_) + off;
+          (void)::madvise(chunk, n, MADV_POPULATE_READ);
+          // Keep the pages cached but on the standby list: they stay in RAM,
+          // count as available memory and yield to allocations first.
+          (void)::madvise(chunk, n, MADV_DONTNEED);
         }
       });
     }

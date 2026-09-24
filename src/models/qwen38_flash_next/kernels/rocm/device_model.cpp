@@ -1,6 +1,9 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
 #include <hip/hip_runtime.h>
+#ifdef _WIN32
+#include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <initializer_list>
@@ -345,6 +348,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
   }
+#ifdef _WIN32
+  // Mapped pages read during upload stay in the working set on Windows and
+  // hide ~17 GiB from the host snapshot budget. Move them to standby.
+  for (const auto& shard : shards)
+    (void)madvise(const_cast<void*>(shard.data), shard.size, MADV_DONTNEED);
+#endif
   return m;
 }
 
