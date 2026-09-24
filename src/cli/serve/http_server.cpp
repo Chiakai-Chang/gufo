@@ -1441,8 +1441,13 @@ void HttpServer::handle_connection(int client_fd) {
     if (resp.status >= 400) {
       try {
         const auto body = json::parse(resp.body);
-        if (const auto* error = body.find("error"))
+        if (const auto* error = body.find("error")) {
           resp.log_details += " error_code=" + error->member_str("code");
+          std::string message = error->member_str("message");
+          if (message.size() > 200)
+            message.resize(200);
+          resp.log_details += " error=\"" + message + "\"";
+        }
       } catch (const std::exception&) {
         // The status remains useful for an endpoint returning a non-JSON error.
       }

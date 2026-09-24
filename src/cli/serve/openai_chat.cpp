@@ -37,6 +37,10 @@ struct ParsedChatRequest {
   sampling::SamplingConfig sampling;
   bool stream{false};
   bool include_usage{false};
+  /// OpenAI "stop" strings, applied to content (not reasoning).
+  std::vector<std::string> stop;
+  /// Accepted-but-ignored fields, reported in the request log.
+  std::string ignored_fields;
 };
 
 struct ParsedToolCall {
@@ -646,14 +650,63 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
       (!choices->is_number() || choices->as_double() != 1.0)) {
     return Error(400, "Bad Request", "only n=1 is supported", "unsupported_n");
   }
-  for (const std::string_view unsupported :
-       {"logprobs", "top_logprobs", "stop", "response_format", "modalities",
-        "audio"}) {
-    if (body.contains(std::string(unsupported))) {
-      return Error(
-          400, "Bad Request",
-          "request field '" + std::string(unsupported) + "' is not implemented",
-          "unsupported_field");
+  // Accept what llama-server accepts. Fields Gufo cannot honour exactly are
+  // ignored and named in the request log instead of failing the request.
+  const auto ignore = [&](std::string_view field) {
+    if (!output->ignored_fields.empty())
+      output->ignored_fields += ',';
+    output->ignored_fields += field;
+  };
+  if (body.contains("audio")) {
+    return Error(400, "Bad Request", "request field 'audio' is not implemented",
+                 "unsupported_field");
+  }
+  if (const json::Value* logprobs = body.find("logprobs")) {
+    if (!logprobs->is_null() && !logprobs->is_bool())
+      return Error(400, "Bad Request", "'logprobs' must be a boolean",
+                   "invalid_logprobs");
+    if (logprobs->is_bool() && logprobs->as_bool())
+      ignore("logprobs");
+  }
+  if (const json::Value* top = body.find("top_logprobs")) {
+    if (!top->is_null() && !(top->is_number() && top->as_double() == 0.0))
+      ignore("top_logprobs");
+  }
+  if (const json::Value* modalities = body.find("modalities")) {
+    if (!modalities->is_null()) {
+      if (!modalities->is_array())
+        return Error(400, "Bad Request", "'modalities' must be an array",
+                     "invalid_modalities");
+      for (const json::Value& item : modalities->items()) {
+        if (!item.is_string() || item.get_str() != "text")
+          return Error(400, "Bad Request", "only the 'text' output modality is supported",
+                       "unsupported_field");
+      }
+    }
+  }
+  if (const json::Value* format = body.find("response_format")) {
+    if (!format->is_null()) {
+      if (!format->is_object())
+        return Error(400, "Bad Request", "'response_format' must be an object",
+                     "invalid_response_format");
+      const std::string type = format->member_str("type");
+      if (type != "text")
+        ignore("response_format:" + type);  // no grammar constraint in Gufo
+    }
+  }
+  if (const json::Value* stop = body.find("stop")) {
+    if (stop->is_string()) {
+      if (!stop->get_str().empty())
+        output->stop.push_back(stop->get_str());
+    } else if (stop->is_array()) {
+      for (const json::Value& item : stop->items()) {
+        if (!item.is_string())
+          return Error(400, "Bad Request", "'stop' entries must be strings", "invalid_stop");
+        if (!item.get_str().empty())
+          output->stop.push_back(item.get_str());
+      }
+    } else if (!stop->is_null()) {
+      return Error(400, "Bad Request", "'stop' must be a string or an array", "invalid_stop");
     }
   }
   return std::nullopt;
@@ -1337,15 +1390,31 @@ private:
   bool tool_mode_{false};
 };
 
+// Earliest occurrence of any stop string in text, or npos.
+std::size_t FindStop(std::string_view text, const std::vector<std::string>& stops) {
+  std::size_t best = std::string_view::npos;
+  for (const auto& stop : stops) {
+    const auto pos = text.find(stop);
+    if (pos < best)
+      best = pos;
+  }
+  return best;
+}
+
 HttpResponse NonStreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
     TextGenerationBackend::InitialOutputState initial_output_state) {
   const auto result = generation->Wait();
   core::Utf8Decoder decoder;
-  const ParsedGeneration generated =
+  ParsedGeneration generated =
       ParseGeneration(decoder.Push(result.text, true), initial_output_state,
                       request.chat.tools, request.chat.tool_choice);
+  // Stop strings are applied after the fact here: correct output, but the
+  // model may have generated past the stop point.
+  const std::size_t stop_at = FindStop(generated.text, request.stop);
+  if (stop_at != std::string::npos)
+    generated.text.resize(stop_at);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -1369,7 +1438,9 @@ HttpResponse NonStreamingResponse(
     message["tool_calls"] = ToolCallsJson(generated.tool_calls);
   }
   choice["message"] = std::move(message);
-  choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
+  choice["finish_reason"] = stop_at != std::string::npos
+                                ? "stop"
+                                : FinishReason(result, !generated.tool_calls.empty());
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
@@ -1387,7 +1458,9 @@ HttpResponse NonStreamingResponse(
       .body = response.dump(),
       .headers = {{"Server-Timing", timing.str()}},
       .streaming_body = {},
-      .log_details = GenerationLogDetails(result),
+      .log_details = GenerationLogDetails(result) +
+                     (request.ignored_fields.empty() ? std::string()
+                                                     : " ignored=" + request.ignored_fields),
   };
 }
 
@@ -1422,20 +1495,55 @@ HttpResponse StreamingResponse(
             }
 
             bool connected = true;
+            const auto send = [&](std::string_view text, bool is_reasoning) {
+              if (text.empty())
+                return connected;
+              json::Value delta = json::Value::object();
+              if (is_reasoning) {
+                delta["reasoning_content"] = std::string(text);
+              } else {
+                delta["content"] = std::string(text);
+              }
+              connected =
+                  writer(Sse(ChoiceChunk(id, created, model, std::move(delta))));
+              return connected;
+            };
+            // Stop strings: hold back a tail that could start a stop string,
+            // cut at the first full match and end the generation there.
+            std::size_t max_stop = 0;
+            for (const auto& s : request.stop)
+              max_stop = std::max(max_stop, s.size());
+            std::string held;
+            bool stopped = false;
             StreamingTextFilter filter(
                 initial_output_state,
                 [&](std::string_view text, bool is_reasoning) {
-                  if (text.empty()) {
+                  if (text.empty())
                     return true;
+                  if (is_reasoning || request.stop.empty())
+                    return send(text, is_reasoning);
+                  if (stopped)
+                    return false;
+                  held.append(text);
+                  if (const auto cut = FindStop(held, request.stop);
+                      cut != std::string::npos) {
+                    stopped = true;
+                    send(std::string_view(held).substr(0, cut), false);
+                    held.clear();
+                    return false;
                   }
-                  json::Value delta = json::Value::object();
-                  if (is_reasoning) {
-                    delta["reasoning_content"] = std::string(text);
-                  } else {
-                    delta["content"] = std::string(text);
+                  if (held.size() >= max_stop) {
+                    std::size_t keep = held.size() - (max_stop - 1);
+                    // Never split a UTF-8 sequence across two chunks.
+                    while (keep > 0 &&
+                           (static_cast<unsigned char>(held[keep]) & 0xC0) == 0x80)
+                      --keep;
+                    if (keep > 0) {
+                      const bool ok = send(std::string_view(held).substr(0, keep), false);
+                      held.erase(0, keep);
+                      return ok;
+                    }
                   }
-                  connected = writer(
-                      Sse(ChoiceChunk(id, created, model, std::move(delta))));
                   return connected;
                 });
 
@@ -1444,18 +1552,24 @@ HttpResponse StreamingResponse(
                 return connected && filter.Push(piece);
               });
               stream_log->details = GenerationLogDetails(result);
+              if (!request.ignored_fields.empty())
+                stream_log->details += " ignored=" + request.ignored_fields;
               RecordServerMetrics(result);
-              if (!connected || result.cancelled) {
+              if (!connected || (result.cancelled && !stopped)) {
                 return;
               }
-              if (!filter.Push({}, true))
-                return;
-
-              const ParsedGeneration generated =
-                  ParseGeneration(filter.raw(), initial_output_state,
-                                  request.chat.tools, request.chat.tool_choice);
-              if (!filter.Finish(!generated.tool_calls.empty())) {
-                return;
+              ParsedGeneration generated;
+              if (!stopped) {
+                if (!filter.Push({}, true) || stopped)
+                  return;
+                generated =
+                    ParseGeneration(filter.raw(), initial_output_state,
+                                    request.chat.tools, request.chat.tool_choice);
+                if (!filter.Finish(!generated.tool_calls.empty()))
+                  return;
+                if (!stopped && !held.empty() && !send(held, false))
+                  return;
+                held.clear();
               }
               for (std::size_t index = 0; index < generated.tool_calls.size();
                    ++index) {
@@ -1481,7 +1595,8 @@ HttpResponse StreamingResponse(
               json::Value terminal_delta = json::Value::object();
               auto terminal_chunk = ChoiceChunk(
                   id, created, model, std::move(terminal_delta),
-                  FinishReason(result, !generated.tool_calls.empty()));
+                  stopped ? "stop"
+                          : FinishReason(result, !generated.tool_calls.empty()));
               // llama.cpp reports timings on the terminal choice regardless
               // of the optional OpenAI usage chunk. Proxies need these even
               // when a client does not request stream_options.include_usage.
