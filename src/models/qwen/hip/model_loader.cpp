@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -24,6 +25,8 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
     if (region.host_copy != nullptr) {
       (void)hipHostUnregister(region.host_copy);
       (void)munmap(region.host_copy, region.size);
+    } else if (region.device_data != nullptr) {
+      (void)hipFree(region.device_data);
     }
     region = {};
   }
@@ -66,8 +69,45 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
                             "cannot read mapped Qwen weights");
 }
 
+// Windows keeps the default 64 GiB carve as dedicated VRAM, so registered host
+// memory is not the same pool as on Linux UMA. Copy weights into device memory
+// there unless GUFO_WEIGHTS=host asks for the original mapped registration.
+[[nodiscard]] bool UseDeviceWeights() {
+  const char* mode = std::getenv("GUFO_WEIGHTS");
+#ifdef _WIN32
+  return !(mode && std::string_view(mode) == "host");
+#else
+  return mode && std::string_view(mode) == "device";
+#endif
+}
+
+[[nodiscard]] hipError_t CopyRegionToDevice(
+    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
+  void* device = nullptr;
+  if (const auto error = hipMalloc(&device, source.size); error != hipSuccess)
+    return error;
+  constexpr std::size_t kChunkBytes = 64ULL << 20;
+  const auto* bytes = static_cast<const std::uint8_t*>(source.data);
+  for (std::size_t offset = 0; offset < source.size; offset += kChunkBytes) {
+    const auto count = std::min(kChunkBytes, source.size - offset);
+    if (const auto error = hipMemcpy(static_cast<std::uint8_t*>(device) + offset,
+                                     bytes + offset, count, hipMemcpyHostToDevice);
+        error != hipSuccess) {
+      (void)hipFree(device);
+      return error;
+    }
+  }
+  destination = {.host_data = source.data,
+                 .device_data = device,
+                 .host_copy = nullptr,
+                 .size = source.size};
+  return hipSuccess;
+}
+
 [[nodiscard]] hipError_t MapRegisteredRegion(
     const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
+  if (UseDeviceWeights())
+    return CopyRegionToDevice(source, destination);
   void* host_copy = mmap(nullptr, source.size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (host_copy == MAP_FAILED)

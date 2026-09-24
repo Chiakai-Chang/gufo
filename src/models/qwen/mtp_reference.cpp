@@ -31,7 +31,9 @@ bool IsNormType(core::GgmlType type) noexcept {
 
 bool IsMatrixType(core::GgmlType type) noexcept {
   return IsNormType(type) || type == core::GgmlType::kQ3_K ||
-         type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ6_K;
+         type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ6_K ||
+         type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ8_0 ||
+         type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kIQ4_XS;
 }
 
 bool Validate(const models::QwenTensorRef& tensor, std::size_t elements,

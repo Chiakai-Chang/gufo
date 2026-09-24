@@ -200,8 +200,12 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
     shard.size = static_cast<std::uint64_t>(info.st_size);
     // Reopening the retained descriptor creates an independent O_DIRECT file
     // description without resolving the original, replaceable pathname.
+#ifdef _WIN32
+    shard.direct_fd = gufo_reopen_direct(shard.fd);
+#else
     const auto path = "/proc/self/fd/" + std::to_string(shard.fd);
     shard.direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+#endif
   }
   for (auto& slot : s.slots) {
     if (hipHostMalloc(&slot.buffer, kChunkBytes + kAlignment) != hipSuccess ||

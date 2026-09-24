@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include "src/core/platform/socket.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -54,7 +55,7 @@ namespace {
 bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   char buf[4096];
   while (out.find(delim) == std::string::npos) {
-    const ssize_t n = ::read(fd, buf, sizeof(buf));
+    const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
     if (n <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(n));
@@ -70,7 +71,7 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   char buf[4096];
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const ssize_t r = ::read(fd, buf, want);
+    const ssize_t r = ::recv(fd, buf, static_cast<int>(want), 0);
     if (r <= 0)
       return false;
     out.append(buf, static_cast<std::size_t>(r));
@@ -87,7 +88,7 @@ bool SendAll(int fd, std::string_view data) {
 #else
     const int flags = 0;
 #endif
-    const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, flags);
+    const ssize_t n = ::send(fd, data.data() + sent, static_cast<int>(data.size() - sent), flags);
     if (n <= 0)
       return false;
     sent += static_cast<std::size_t>(n);
@@ -109,7 +110,7 @@ bool SendChunk(int fd, std::string_view data) {
 
 bool IsPeerDisconnected(int fd) noexcept {
   pollfd descriptor{
-      .fd = fd,
+      .fd = static_cast<decltype(pollfd::fd)>(fd),
       .events = POLLIN | POLLERR | POLLHUP,
       .revents = 0,
   };
@@ -938,7 +939,7 @@ HttpServer::HttpServer(std::string host, int port,
 HttpServer::~HttpServer() {
   stop();
   if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
+    platform::CloseSocket(listen_fd_);
   }
 }
 
@@ -997,29 +998,29 @@ bool HttpServer::start(std::string* error) {
     return false;
   }
   addr.sin_port = htons(static_cast<unsigned short>(port_));
-  (void)::signal(SIGPIPE, SIG_IGN);
-  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  platform::IgnoreSigpipe();
+  listen_fd_ = platform::OpenTcpSocket();
   if (listen_fd_ < 0) {
     if (error != nullptr)
       *error = "socket() failed";
     return false;
   }
   const int yes = 1;
-  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
 
   if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
       0) {
     if (error != nullptr) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
-    ::close(listen_fd_);
+    platform::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
   if (::listen(listen_fd_, 16) < 0) {
     if (error != nullptr)
       *error = "listen() failed";
-    ::close(listen_fd_);
+    platform::CloseSocket(listen_fd_);
     listen_fd_ = -1;
     return false;
   }
@@ -1031,7 +1032,7 @@ bool HttpServer::start(std::string* error) {
       if (error != nullptr) {
         *error = "getsockname() failed";
       }
-      ::close(listen_fd_);
+      platform::CloseSocket(listen_fd_);
       listen_fd_ = -1;
       return false;
     }
@@ -1048,7 +1049,7 @@ void HttpServer::run() {
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
   while (!stopped_.load(std::memory_order_acquire)) {
-    const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
+    const int client_fd = platform::AcceptSocket(listen_fd_);
     if (client_fd < 0) {
       if (stopped_.load(std::memory_order_acquire)) {
         break;
@@ -1056,7 +1057,7 @@ void HttpServer::run() {
       continue;
     }
     if (stopped_.load(std::memory_order_acquire)) {
-      ::close(client_fd);
+      platform::CloseSocket(client_fd);
       break;
     }
 
@@ -1074,7 +1075,7 @@ void HttpServer::run() {
           handle_connection(client_fd);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
-            ::close(worker_ptr->fd);
+            platform::CloseSocket(worker_ptr->fd);
             worker_ptr->fd = -1;
           }
           worker_ptr->done.store(true, std::memory_order_release);
@@ -1088,7 +1089,7 @@ void HttpServer::run() {
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
       (void)SendAll(client_fd, BuildResponse(response));
-      ::close(client_fd);
+      platform::CloseSocket(client_fd);
     }
   }
   reap_workers();
@@ -1229,9 +1230,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 void HttpServer::handle_connection(int client_fd) {
-  const struct timeval tv{120, 0};
-  ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  platform::SetSocketTimeouts(client_fd, 120, true, true);
 
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;

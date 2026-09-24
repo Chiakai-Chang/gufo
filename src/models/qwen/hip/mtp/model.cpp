@@ -68,6 +68,18 @@ void ReadMatrixRow(const models::QwenTensorRef& tensor, std::size_t row,
     case core::GgmlType::kQ6_K:
       quant::DequantizeQ6_K(source, output, columns);
       return;
+    case core::GgmlType::kQ5_K:
+      quant::DequantizeQ5_K(source, output, columns);
+      return;
+    case core::GgmlType::kQ8_0:
+      quant::DequantizeQ8_0(source, output, columns);
+      return;
+    case core::GgmlType::kIQ4_NL:
+      quant::DequantizeIQ4_NL(source, output, columns);
+      return;
+    case core::GgmlType::kIQ4_XS:
+      quant::DequantizeIQ4_XS(source, output, columns);
+      return;
     default:
       throw std::runtime_error("unsupported MTP matrix type");
   }
