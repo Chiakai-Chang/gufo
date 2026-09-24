@@ -7,6 +7,8 @@
 Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
 Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
 
+**Contrinutions are welcome!**
+
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):
@@ -27,13 +29,15 @@ individual request decode rates. Qwen27B's single-user peak uses the short-promp
 C1 workload. Audio excludes loading.
 Each model guide lists the required files and complete benchmark settings.
 
-## Design principles
+## Philosophy
 
-- Optimize for Strix Halo with 128 GiB. Smaller configurations have not been qualified.
-- Preserve quality when optimizing. Each model's quality report records independent numerical checks, execution consistency and unresolved gaps.
-- Support a focused set of models with kernels that can evolve independently.
+- Contributions are welcome! We need the help of Strix Halo community to keep improving gufo!
+- We would like this to be the one-stop shop for Strix Halo Local AI enthusiasts: batteries included for text, audio, image, and video models.
+- Build and optimize specifically for the Strix Halo 128 GiB hardware. Smaller memory configurations should still work and preserve the speed benefits for models that can fit on memory.
+- Support only the best available models for their size that can run on this hardware: less code to maintain, more focused optimization and testing work.
+- Preserve quality when optimizing. Each model's quality report records independent numerical checks, execution consistency and unresolved gaps. Don't reuse kernels across different models to limit blast radius of a code change.
 - Treat concurrent requests, cancellation and conversation caching as first-class workloads.
-- Keep production dependencies small and development tools separate. Contributions are welcome.
+- Keep production dependencies small and development tools separate.
 
 ## Quickstart
 
