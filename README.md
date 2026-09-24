@@ -9,6 +9,8 @@ Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unifie
 
 **Contrinutions are welcome!**
 
+> **This fork adds native Windows support** (Windows 11, TheRock ROCm SDK, no WSL), `--chat-template-file` (llama.cpp Jinja engine) and a few serving fixes on branch `windows-port`. See [docs/WINDOWS.md](docs/WINDOWS.md).
+
 ## Models and benchmarks
 
 All model documentation lives under [docs/models](docs/models/README.md):

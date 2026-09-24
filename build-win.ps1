@@ -1,18 +1,28 @@
 # Configure and build Gufo on Windows with the TheRock ROCm SDK and vcpkg.
+# See docs/WINDOWS.md.
 param(
   [string]$Rocm = "C:/rocm-sdk/rocm",
   [string]$Vcpkg = "C:/vcpkg",
+  [string]$VisualStudio = "",  # install root; empty = newest found by vswhere
   [string]$BuildDir = "build/win-release",
   [int]$Jobs = 8,
   [switch]$ConfigureOnly
 )
 $ErrorActionPreference = "Stop"
-$vs = "C:\Program Files\Microsoft Visual Studio\18\Insiders"
-$cmake = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-$ninja = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+
+if (-not $VisualStudio) {
+  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+  if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found; pass -VisualStudio <install root>" }
+  $VisualStudio = & $vswhere -latest -prerelease -products * `
+    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if (-not $VisualStudio) { throw "no Visual Studio with the C++ x64 tools found; pass -VisualStudio" }
+}
+$env:PATH = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer;$env:PATH"
+$cmake = "$VisualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+$ninja = "$VisualStudio\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
 
 # clang targets the MSVC ABI and needs the MSVC/SDK library environment.
-$vcvars = "$vs\VC\Auxiliary\Build\vcvars64.bat"
+$vcvars = "$VisualStudio\VC\Auxiliary\Build\vcvars64.bat"
 cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
   if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
 }
