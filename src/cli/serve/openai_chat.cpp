@@ -914,10 +914,6 @@ void ParseQwenCalls(std::string_view text,
         close += end.size();
       }
     }
-    if (complete && !tools.empty() &&
-        std::ranges::none_of(
-            tools, [&](const auto& tool) { return tool.name == call.name; }))
-      complete = false;
     if (complete) {
       call.id = RandomId("call_");
       calls->push_back(std::move(call));
