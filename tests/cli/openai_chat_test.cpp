@@ -503,7 +503,14 @@ void TestQwenToolBoundariesAndSchema() {
              1, R"({"text":"literal </think>"})"},
         Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"text\":"
              "\"literal </tool_call>\"}}</tool_call>",
-             1, R"({"text":"literal </tool_call>"})"}}) {
+             1, R"({"text":"literal </tool_call>"})"},
+        // The model ended its turn after </function>.
+        Case{"<tool_call><function=f><parameter=text>ok</parameter>"
+             "</function>\n",
+             1, R"({"text":"ok"})"},
+        Case{"<tool_call><function=f><parameter=text>ok</parameter>"
+             "</function> trailing",
+             0, ""}}) {
     for (bool reasoning : {false, true}) {
       for (bool stream : {false, true}) {
         auto body = schema;
@@ -597,11 +604,12 @@ void TestToolChoiceEnforcement() {
               output += part;
               return true;
             });
-          const bool allowed = std::string_view(declared) == "f" &&
-                               std::string_view(choice) != "none";
+          // A call to a tool outside the request is still returned when tools
+          // are enabled (deferred tools), as llama-server does.
+          const bool allowed = *declared && std::string_view(choice) != "none";
           Expect(
               (output.find("\"tool_calls\":") != std::string::npos) == allowed,
-              "only declared, enabled tool calls can enter API output");
+              "tool calls enter API output only when tools are enabled");
           if (required && !allowed)
             Expect(
                 output.find("tool_choice_unsatisfied") != std::string::npos &&

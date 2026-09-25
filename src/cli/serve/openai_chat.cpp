@@ -889,7 +889,10 @@ void ParseQwenCalls(std::string_view text,
             {.name = name, .value = std::string(raw), .is_string = is_string});
         body.remove_prefix(close + std::string_view{"</parameter>"}.size());
       }
-      complete = valid && consume("</function>") && consume(end);
+      // The model sometimes ends its turn right after </function>; a call
+      // missing only </tool_call> at the end of the output is still whole.
+      complete = valid && consume("</function>") &&
+                 (consume(end) || Trim(body).empty());
     } else {
       // JSON calls already encode their argument types. Try closing markers
       // until the preceding payload is complete JSON (a marker in a quoted
