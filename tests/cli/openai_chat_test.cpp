@@ -471,7 +471,7 @@ void TestQwenToolBoundariesAndSchema() {
     "model":"test-model", "messages":[{"role":"user","content":"use f"}],
     "tools":[{"type":"function","function":{"name":"f","parameters":{
       "type":"object","properties":{"text":{"type":"string"},
-      "count":{"type":"integer"}}}}}]
+      "count":{"type":"integer"},"flag":{"type":"boolean"}}}}}]
   })");
   const std::string good =
       "<tool_call><function=f><parameter=text>42</parameter>"
@@ -486,9 +486,17 @@ void TestQwenToolBoundariesAndSchema() {
         Case{"<tool_call><function=f><parameter=text>literal </tool_call> "
              "and </function></parameter></function></tool_call>",
              1, R"({"text":"literal </tool_call> and </function>"})"},
+        // A value the schema rejects is passed through as a string.
         Case{"<tool_call><function=f><parameter=text>ok</parameter>"
              "<parameter=count>oops</parameter></function></tool_call>",
-             0, ""},
+             1, R"({"text":"ok","count":"oops"})"},
+        // Python literals are read as JSON booleans / null.
+        Case{"<tool_call><function=f><parameter=flag>\nTrue\n</parameter>"
+             "</function></tool_call>",
+             1, R"({"flag":true})"},
+        Case{"<tool_call><function=f><parameter=flag>False</parameter>"
+             "</function></tool_call>",
+             1, R"({"flag":false})"},
         Case{"<tool_call><function=f><parameter=text>ok</parameter>"
              "<parameter=count>42</function></tool_call>",
              0, ""},

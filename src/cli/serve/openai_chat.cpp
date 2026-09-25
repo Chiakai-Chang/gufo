@@ -871,8 +871,7 @@ void ParseQwenCalls(std::string_view text,
           valid = false;
           break;
         }
-        const auto raw = Trim(body.substr(0, close));
-        const auto parsed = TryParseJson(raw);
+        std::string_view raw = Trim(body.substr(0, close));
         const auto* properties = schema ? schema->find("properties") : nullptr;
         const auto* property = properties ? properties->find(name) : nullptr;
         const bool string_allowed =
@@ -880,10 +879,24 @@ void ParseQwenCalls(std::string_view text,
             SchemaAccepts(*property, json::Value(std::string(raw)));
         // Prefer text if the schema permits it; parsing ambiguous scalars
         // as JSON would silently change a caller's declared string type.
-        const bool is_string = string_allowed;
-        if (!is_string && (!parsed || !SchemaAccepts(*property, *parsed))) {
-          valid = false;
-          break;
+        bool is_string = string_allowed;
+        if (!is_string) {
+          // Models often write Python literals (True/False/None).
+          const auto lower = [&] {
+            std::string out(raw);
+            for (char& c : out)
+              c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return out;
+          }();
+          if (lower == "true" || lower == "false")
+            raw = lower == "true" ? "true" : "false";
+          else if (lower == "none" || lower == "null")
+            raw = "null";
+          const auto parsed = TryParseJson(raw);
+          // A value the schema rejects is passed through as a string, as
+          // llama-server does: the client can answer with a validation error
+          // the model can fix, whereas dropping the call left an empty reply.
+          is_string = !parsed || !SchemaAccepts(*property, *parsed);
         }
         call.arguments.push_back(
             {.name = name, .value = std::string(raw), .is_string = is_string});
