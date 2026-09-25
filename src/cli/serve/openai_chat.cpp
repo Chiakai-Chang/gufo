@@ -848,7 +848,9 @@ void ParseQwenCalls(std::string_view text,
           break;
         }
       }
-      if (call.name.empty() || (!tools.empty() && !schema))
+      // A name outside the request's tools is still a call (deferred tools);
+      // its arguments stay strings because there is no schema to type them.
+      if (call.name.empty())
         continue;
       bool valid = true;
       while (consume("<parameter=")) {
