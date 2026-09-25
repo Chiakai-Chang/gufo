@@ -1,6 +1,8 @@
 #include "src/cli/serve/openai_chat.hpp"
 
 #include <cstdlib>
+#include <mutex>
+#include <fstream>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -1109,10 +1111,11 @@ ParsedGeneration ParseGeneration(
     const std::string text_from_tools = parsed.text.substr(marker);
     ParseQwenCalls(text_from_tools, tools, &parsed.tool_calls);
     ParseDsmlCalls(text_from_tools, &parsed.tool_calls);
-    std::erase_if(parsed.tool_calls, [&](const auto& call) {
-      return std::ranges::none_of(
-          tools, [&](const auto& tool) { return tool.name == call.name; });
-    });
+    // Keep calls to tools that are not in this request, as llama-server does.
+    // Agent clients with deferred tools answer those with a corrective tool
+    // result; dropping them silently left an empty reply and a retry loop.
+    std::erase_if(parsed.tool_calls,
+                  [](const auto& call) { return call.name.empty(); });
     if (!parsed.tool_calls.empty()) {
       parsed.text = text_before_tools;
     }
@@ -1390,6 +1393,30 @@ private:
   bool tool_mode_{false};
 };
 
+// GUFO_DUMP_OUTPUT=FILE appends one JSON line per chat generation: the raw
+// model text and how it was split, to diagnose empty or malformed replies.
+void DumpOutput(std::string_view raw, const ParsedGeneration& parsed,
+                std::string_view finish, std::size_t prompt_tokens) {
+  static const char* path = std::getenv("GUFO_DUMP_OUTPUT");
+  if (path == nullptr || *path == 0)
+    return;
+  json::Value line = json::Value::object();
+  line["time"] = static_cast<long long>(std::time(nullptr));
+  line["prompt_tokens"] = static_cast<std::uint64_t>(prompt_tokens);
+  line["finish"] = std::string(finish);
+  line["raw"] = std::string(raw);
+  line["reasoning_chars"] = static_cast<std::uint64_t>(parsed.reasoning_content.size());
+  line["content_chars"] = static_cast<std::uint64_t>(parsed.text.size());
+  json::Value names = json::Value::array();
+  for (const auto& call : parsed.tool_calls)
+    names.push_back(call.name);
+  line["tool_calls"] = std::move(names);
+  static std::mutex mutex;
+  const std::lock_guard lock(mutex);
+  std::ofstream out(path, std::ios::binary | std::ios::app);
+  out << line.dump() << "\n";
+}
+
 // Earliest occurrence of any stop string in text, or npos.
 std::size_t FindStop(std::string_view text, const std::vector<std::string>& stops) {
   std::size_t best = std::string_view::npos;
@@ -1415,6 +1442,10 @@ HttpResponse NonStreamingResponse(
   const std::size_t stop_at = FindStop(generated.text, request.stop);
   if (stop_at != std::string::npos)
     generated.text.resize(stop_at);
+  DumpOutput(result.text, generated,
+             stop_at != std::string::npos ? "stop"
+                                          : FinishReason(result, !generated.tool_calls.empty()),
+             result.prompt_tokens);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -1565,6 +1596,9 @@ HttpResponse StreamingResponse(
                 generated =
                     ParseGeneration(filter.raw(), initial_output_state,
                                     request.chat.tools, request.chat.tool_choice);
+                DumpOutput(filter.raw(), generated,
+                           FinishReason(result, !generated.tool_calls.empty()),
+                           result.prompt_tokens);
                 if (!filter.Finish(!generated.tool_calls.empty()))
                   return;
                 if (!stopped && !held.empty() && !send(held, false))
