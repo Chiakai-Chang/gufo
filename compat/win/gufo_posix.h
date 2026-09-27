@@ -101,6 +101,7 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice);
 #define LOCK_UN 8
 int flock(int fd, int operation);
 int mkstemp(char* tmpl);
+char* mkdtemp(char* tmpl);
 
 // ---- resource / utsname ----------------------------------------------------
 struct gufo_timeval_ru { long tv_sec; long tv_usec; };
@@ -158,6 +159,8 @@ int fstatat(int dirfd, const char* path, struct _stat64* st, int flags);
 int utimensat(int dirfd, const char* path, const struct timespec times[2], int flags);
 int geteuid(void);
 int mincore(void* addr, size_t length, unsigned char* vec);
+int gufo_lstat_w(const wchar_t* path, struct _stat64* st);
+int gufo_lstat_a(const char* path, struct _stat64* st);
 int dprintf(int fd, const char* format, ...);
 struct _iobuf;
 struct _iobuf* fmemopen(void* buf, size_t size, const char* mode);
@@ -185,7 +188,7 @@ static inline struct tm* localtime_r(const time_t* t, struct tm* out) {
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #endif
 #ifndef S_ISLNK
-#define S_ISLNK(m) 0
+#define S_ISLNK(m) (((m) & _S_IFMT) == 0xA000)
 #endif
 #ifndef S_IRUSR
 #define S_IRUSR _S_IREAD
@@ -212,6 +215,10 @@ inline int chmod(const wchar_t* path, int mode) { return _wchmod(path, mode); }
 inline int unlink(const wchar_t* path) { return _wunlink(path); }
 inline int mkdir(const wchar_t* path, int) { return _wmkdir(path); }
 inline int mkdir(const char* path, int) { return _mkdir(path); }
+// lstat: like stat, but a reparse point (symlink, junction) is reported as a
+// link instead of the file or directory it points at.
+inline int gufo_lstat(const wchar_t* path, struct _stat64* st) { return gufo_lstat_w(path, st); }
+inline int gufo_lstat(const char* path, struct _stat64* st) { return gufo_lstat_a(path, st); }
 #endif
 
 // struct stat / fstat / stat with 64-bit st_size.
@@ -220,6 +227,6 @@ inline int mkdir(const char* path, int) { return _mkdir(path); }
 #define fstat _fstat64
 #endif
 #define lseek _lseeki64
-#define lstat _stat64
+#define lstat gufo_lstat
 
 #endif  // _WIN32

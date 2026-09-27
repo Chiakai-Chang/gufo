@@ -270,6 +270,70 @@ void TestByteCapacityEvictsBeforeSnapshotAllocation() {
          "commit converts the reservation into exact retained bytes");
 }
 
+void TestEvictionSinkWritesBackOnlyUnsupersededSnapshots() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  const auto make_cache = [](std::vector<std::size_t>* invalidations,
+                             std::size_t* next_id) {
+    return std::make_unique<gufo::server::ContinuationCache>(
+        2,
+        [invalidations, next_id] {
+          return std::make_unique<FakeState>((*next_id)++, invalidations);
+        },
+        gufo::server::ContinuationCache::SnapshotSupport{
+            .restore =
+                [](gufo::server::ContinuationState& state,
+                   const gufo::server::ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [] { return 12; },
+            .on_event = {},
+        });
+  };
+
+  // Another conversation pushes the snapshot out: it goes to the lower tier.
+  {
+    std::vector<std::size_t> invalidations(2);
+    std::size_t next_id = 0;
+    auto cache = make_cache(&invalidations, &next_id);
+    std::vector<Tokens> written;
+    cache->SetSnapshotEvictionSink(
+        [&](Tokens tokens, std::shared_ptr<const gufo::server::ContinuationSnapshot>,
+            std::vector<std::uint8_t>) { written.push_back(std::move(tokens)); });
+    {
+      auto main = cache->Acquire(Tokens{1, 2, 3});
+      Expect(main.TryReserveSnapshot(8, 3), "main snapshot fits");
+      main.Commit({1, 2, 3}, std::make_unique<FakeSnapshot>(7, 8));
+    }
+    auto side = cache->Acquire(Tokens{9, 8, 7});
+    Expect(side.TryReserveSnapshot(12, 3), "side reservation evicts main");
+    Expect(written.size() == 1 && written.front() == Tokens{1, 2, 3},
+           "a snapshot evicted by another conversation is written back");
+    side.Commit({9, 8, 7}, std::make_unique<FakeSnapshot>(9, 12));
+  }
+
+  // The same conversation replaces its own older snapshot: nothing to write.
+  {
+    std::vector<std::size_t> invalidations(2);
+    std::size_t next_id = 0;
+    auto cache = make_cache(&invalidations, &next_id);
+    std::vector<Tokens> written;
+    cache->SetSnapshotEvictionSink(
+        [&](Tokens tokens, std::shared_ptr<const gufo::server::ContinuationSnapshot>,
+            std::vector<std::uint8_t>) { written.push_back(std::move(tokens)); });
+    {
+      auto first = cache->Acquire(Tokens{1, 2, 3});
+      Expect(first.TryReserveSnapshot(8, 3), "first turn snapshot fits");
+      first.Commit({1, 2, 3}, std::make_unique<FakeSnapshot>(7, 8));
+    }
+    auto next = cache->Acquire(Tokens{1, 2, 3, 4});
+    Expect(next.cache_hit(), "next turn extends the retained snapshot");
+    Expect(next.TryReserveSnapshot(12, 4), "next turn evicts its own source");
+    next.Commit({1, 2, 3, 4}, std::make_unique<FakeSnapshot>(8, 12));
+    Expect(written.empty(),
+           "a snapshot superseded by its own continuation is not written back");
+  }
+}
 void TestConcurrentReservationsCannotOvercommitBudget() {
   using gufo::server::SnapshotEventAction;
   using gufo::server::SnapshotEventReason;
@@ -528,6 +592,7 @@ int main() {
   TestWaitingAcquireCanBeCancelled();
   TestSnapshotCanBranchIntoTwoIndependentStateSlots();
   TestByteCapacityEvictsBeforeSnapshotAllocation();
+  TestEvictionSinkWritesBackOnlyUnsupersededSnapshots();
   TestConcurrentReservationsCannotOvercommitBudget();
   TestImpossibleReservationPreservesRetainedEntries();
   TestAbandonedReservationIsReleased();

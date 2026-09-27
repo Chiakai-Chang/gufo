@@ -492,6 +492,32 @@ struct TextRunnerPool::Impl {
       shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
       shared_prefix_max_boundaries =
           disk_cache_options->shared_prefix_max_boundaries;
+      // Write-back: a snapshot the RAM pool drops for capacity goes to disk
+      // (even past the staging budget), so a long conversation pushed out by
+      // side sessions restores from disk instead of re-prefilling.
+      // GUFO_DISK_WRITEBACK=0 turns it off.
+      const char* writeback = std::getenv("GUFO_DISK_WRITEBACK");
+      if (writeback == nullptr || std::string_view(writeback) != "0")
+      cache.SetSnapshotEvictionSink(
+          [runner = std::shared_ptr<const TextModelRunner>(validated.runner),
+           store = std::weak_ptr<ContinuationDiskStore>(disk_store)](
+              std::vector<ContinuationToken> tokens,
+              std::shared_ptr<const ContinuationSnapshot> snapshot,
+              std::vector<std::uint8_t> identity) {
+            auto text_snapshot =
+                std::dynamic_pointer_cast<const TextRunnerSnapshot>(snapshot);
+            const auto disk = store.lock();
+            if (!text_snapshot || !disk)
+              return;
+            const std::size_t token_count = tokens.size();
+            const bool queued = disk->SaveEvicted(
+                runner, std::move(tokens), std::move(text_snapshot),
+                std::move(identity));
+            Logger::Info("cache", std::string("event=snapshot_writeback ") +
+                                      (queued ? "action=queued"
+                                              : "action=skipped reason=busy") +
+                                      " tokens=" + std::to_string(token_count));
+          });
     }
   }
 

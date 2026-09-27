@@ -96,6 +96,12 @@ public:
     SnapshotCapacity capacity_bytes;
     SnapshotEventSink on_event;
   };
+  /// Receives a snapshot the retained pool drops for capacity (not an exact
+  /// replacement), with the tokens and input identity it represents. Called
+  /// outside the cache lock; the sink may keep the snapshot alive.
+  using SnapshotEvictionSink = std::function<void(
+      std::vector<ContinuationToken>,
+      std::shared_ptr<const ContinuationSnapshot>, std::vector<std::uint8_t>)>;
 
   class Lease {
   public:
@@ -183,6 +189,9 @@ public:
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
                     SnapshotSupport snapshot_support = {});
   ~ContinuationCache();
+
+  /// Installs a lower tier for evicted snapshots (for example disk write-back).
+  void SetSnapshotEvictionSink(SnapshotEvictionSink sink);
 
   ContinuationCache(const ContinuationCache&) = delete;
   ContinuationCache& operator=(const ContinuationCache&) = delete;

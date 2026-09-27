@@ -36,6 +36,44 @@ void EmitSnapshotEvents(const ContinuationCache::SnapshotEventSink& sink,
   }
 }
 
+struct EvictedSnapshot {
+  std::vector<ContinuationToken> tokens;
+  std::shared_ptr<const ContinuationSnapshot> snapshot;
+  std::vector<std::uint8_t> identity;
+};
+
+// A dropped snapshot is worth writing back only if no retained snapshot (or
+// the one about to be published) continues the same token history.
+template <typename Entries>
+bool Superseded(const Entries& entries, std::size_t victim,
+                std::span<const ContinuationToken> incoming) {
+  const auto& tokens = entries[victim]->tokens;
+  if (incoming.size() > tokens.size() && IsPrefix(tokens, incoming))
+    return true;
+  for (std::size_t other = 0; other < entries.size(); ++other) {
+    const auto& entry = *entries[other];
+    if (other != victim && entry.valid && entry.snapshot != nullptr &&
+        entry.tokens.size() > tokens.size() && IsPrefix(tokens, entry.tokens))
+      return true;
+  }
+  return false;
+}
+
+void EmitEvictions(const ContinuationCache::SnapshotEvictionSink& sink,
+                   std::vector<EvictedSnapshot>& evicted) noexcept {
+  if (!sink)
+    return;
+  for (auto& item : evicted) {
+    try {
+      sink(std::move(item.tokens), std::move(item.snapshot),
+           std::move(item.identity));
+    } catch (...) {
+      // A lower cache tier must never affect request execution.
+      continue;
+    }
+  }
+}
+
 }  // namespace
 
 struct ContinuationCache::Entry {
@@ -59,6 +97,7 @@ struct ContinuationCache::Entry {
 struct ContinuationCache::Impl {
   std::vector<std::unique_ptr<Entry>> entries;
   SnapshotSupport snapshot_support;
+  SnapshotEvictionSink eviction_sink;
   mutable std::mutex mutex;
   std::condition_variable condition;
   std::uint64_t clock{0};
@@ -441,10 +480,13 @@ bool ContinuationCache::ReserveSnapshot(std::size_t source_index,
                                         std::size_t token_count,
                                         bool preserve_source) {
   std::vector<std::shared_ptr<const ContinuationSnapshot>> removed_snapshots;
+  std::vector<EvictedSnapshot> evicted;
+  SnapshotEvictionSink eviction_sink;
   std::vector<SnapshotEvent> events;
   bool admitted = false;
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
+    eviction_sink = impl_->eviction_sink;
     const auto make_event = [&](SnapshotEventAction action,
                                 SnapshotEventReason reason, std::size_t bytes,
                                 std::size_t tokens) {
@@ -498,6 +540,9 @@ bool ContinuationCache::ReserveSnapshot(std::size_t source_index,
       auto& entry = *impl_->entries[target];
       const std::size_t removed_bytes = entry.snapshot_bytes;
       const std::size_t removed_tokens = entry.tokens.size();
+      if (eviction_sink && target != source_index &&
+          !Superseded(impl_->entries, target, {}))
+        evicted.push_back({entry.tokens, entry.snapshot, entry.input_identity});
       removed_snapshots.push_back(std::move(entry.snapshot));
       entry.tokens.clear();
       entry.snapshot_bytes = 0;
@@ -519,7 +564,13 @@ bool ContinuationCache::ReserveSnapshot(std::size_t source_index,
   }
   removed_snapshots.clear();
   EmitSnapshotEvents(impl_->snapshot_support.on_event, events);
+  EmitEvictions(eviction_sink, evicted);
   return admitted;
+}
+
+void ContinuationCache::SetSnapshotEvictionSink(SnapshotEvictionSink sink) {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->eviction_sink = std::move(sink);
 }
 
 void ContinuationCache::SkipSnapshot(std::size_t reservation_bytes,
@@ -574,10 +625,13 @@ std::size_t ContinuationCache::Commit(
   }
 
   std::vector<std::shared_ptr<const ContinuationSnapshot>> removed_snapshots;
+  std::vector<EvictedSnapshot> evicted;
+  SnapshotEvictionSink eviction_sink;
   std::vector<SnapshotEvent> events;
   std::size_t retained_bytes = 0;
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
+    eviction_sink = impl_->eviction_sink;
     if (reservation_bytes <= impl_->reserved_snapshot_bytes) {
       impl_->reserved_snapshot_bytes -= reservation_bytes;
     } else {
@@ -651,6 +705,10 @@ std::size_t ContinuationCache::Commit(
         if (snapshot_entry.snapshot != nullptr) {
           const std::size_t removed_bytes = snapshot_entry.snapshot_bytes;
           const std::size_t removed_tokens = snapshot_entry.tokens.size();
+          if (eviction_sink && !exact_replacement &&
+              !Superseded(impl_->entries, target, tokens))
+            evicted.push_back({snapshot_entry.tokens, snapshot_entry.snapshot,
+                               snapshot_entry.input_identity});
           removed_snapshots.push_back(std::move(snapshot_entry.snapshot));
           impl_->retained_snapshot_bytes -= removed_bytes;
           snapshot_entry.tokens.clear();
@@ -700,6 +758,7 @@ std::size_t ContinuationCache::Commit(
   }
   removed_snapshots.clear();
   EmitSnapshotEvents(impl_->snapshot_support.on_event, events);
+  EmitEvictions(eviction_sink, evicted);
   impl_->condition.notify_all();
   return retained_bytes;
 }

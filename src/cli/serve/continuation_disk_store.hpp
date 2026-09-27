@@ -144,6 +144,15 @@ public:
       std::vector<std::uint8_t> input_identity = {},
       std::unique_ptr<CaptureReservation> reservation = {});
 
+  /// Writes back a snapshot the RAM pool just evicted. The snapshot already
+  /// lives in host memory, so the staging budget does not apply; at most one
+  /// such write is pending at a time and later ones are skipped meanwhile.
+  /// Returns false when the write was not queued.
+  bool SaveEvicted(std::shared_ptr<const TextModelRunner> runner,
+                   std::vector<TextRunnerToken> checkpoint_tokens,
+                   std::shared_ptr<const TextRunnerSnapshot> snapshot,
+                   std::vector<std::uint8_t> input_identity = {});
+
   /// Drains accepted writes. Shutdown also drains automatically.
   void Flush();
 

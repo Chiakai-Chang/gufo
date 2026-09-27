@@ -67,7 +67,8 @@ gufo.exe serve llm -m <first-shard>.gguf --mmproj <mmproj>.gguf ^
   - chat requests accept `stop` (streaming holds back a possible stop prefix and ends generation at the match), `logprobs`, `top_logprobs`, `response_format` and `modalities: ["text"]`. Fields Gufo cannot honour exactly are logged as `ignored=`.
   - Agent clients such as Hermes probe these and use `response_format` for title generation.
 
-- **`--cache-disk DIR`** works on Windows: the `*at()` calls it uses are implemented on a directory handle (`FILE_FLAG_BACKUP_SEMANTICS`). Put the directory on an NVMe drive.
+- **`--cache-disk DIR`** works on Windows: the `*at()` calls it uses are implemented on a directory handle (`FILE_FLAG_BACKUP_SEMANTICS`), and `lstat`/`fstatat` report reparse points as links. Put the directory on an NVMe drive.
+- **Eviction write-back** (this fork, with `--cache-disk`): a snapshot the RAM pool drops for capacity is written to disk even when it is larger than `--cache-disk-staging-bytes`, unless a retained snapshot already continues it. A long conversation pushed out by side sessions then restores from disk (59.8K tokens in 1.5 s) instead of re-prefilling (about 66 s). `GUFO_DISK_WRITEBACK=0` turns it off.
 - **Request logs** carry `client=<address>` on every line.
 
 ## Not supported on Windows yet

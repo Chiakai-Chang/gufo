@@ -521,6 +521,7 @@ struct ContinuationDiskStore::Impl {
     std::shared_ptr<const TextRunnerSnapshot> snapshot;
     std::vector<std::uint8_t> identity;
     std::size_t retained_bytes;
+    bool evicted{false};
   };
 
   Impl(ContinuationDiskStoreOptions store_options, EventSink sink,
@@ -566,17 +567,21 @@ struct ContinuationDiskStore::Impl {
         pending.pop_front();
       }
       try {
-        (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity);
+        (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity,
+                   job.evicted);
       } catch (...) {
         Emit(ContinuationDiskEventAction::kSkipped,
              ContinuationDiskEventReason::kIoFailure, 0, 0, job.tokens.size());
       }
       const auto released = job.retained_bytes;
+      const bool was_evicted = job.evicted;
       // Release GPU/host snapshot storage before making its budget available.
       job = {};
       {
         std::lock_guard lock(queue_mutex);
         queued_bytes -= released;
+        if (was_evicted)
+          evicted_pending = false;
       }
       queue_changed.notify_all();
     }
@@ -729,7 +734,8 @@ struct ContinuationDiskStore::Impl {
   [[nodiscard]] bool ReadImage(std::string_view filename,
                                std::vector<std::uint8_t>* image,
                                ContinuationDiskEventReason* failure_reason,
-                               std::size_t* file_bytes = nullptr) const {
+                               std::size_t* file_bytes = nullptr,
+                               bool allow_over_staging = false) const {
     if (image == nullptr || failure_reason == nullptr) {
       return false;
     }
@@ -742,7 +748,9 @@ struct ContinuationDiskStore::Impl {
       *file_bytes = static_cast<std::size_t>(status.st_size);
     if (status.st_size <= 0 ||
         static_cast<std::uint64_t>(status.st_size) >
-            static_cast<std::uint64_t>(options.staging_capacity_bytes)) {
+            static_cast<std::uint64_t>(allow_over_staging
+                                           ? options.capacity_bytes
+                                           : options.staging_capacity_bytes)) {
       *failure_reason = status.st_size > 0
                             ? ContinuationDiskEventReason::kStagingCapacity
                             : ContinuationDiskEventReason::kCorrupt;
@@ -1074,7 +1082,8 @@ struct ContinuationDiskStore::Impl {
       const TextModelRunner& runner,
       std::span<const TextRunnerToken> checkpoint_tokens,
       const TextRunnerSnapshot& snapshot,
-      std::span<const std::uint8_t> input_identity) {
+      std::span<const std::uint8_t> input_identity,
+      bool bypass_staging = false) {
     // Serialize writers, but keep existing entries readable during payload
     // serialization, hashing and filesystem durability operations.
     const std::lock_guard write_lock(write_mutex);
@@ -1119,7 +1128,7 @@ struct ContinuationDiskStore::Impl {
       file_bytes = CheckedFileBytes(
           descriptor.persistence->compatibility_identity.size(),
           checkpoint_tokens.size(), payload_bytes);
-      if (file_bytes > options.staging_capacity_bytes) {
+      if (!bypass_staging && file_bytes > options.staging_capacity_bytes) {
         Emit(ContinuationDiskEventAction::kSkipped,
              ContinuationDiskEventReason::kStagingCapacity, file_bytes,
              payload_bytes, checkpoint_tokens.size());
@@ -1220,7 +1229,10 @@ struct ContinuationDiskStore::Impl {
       std::vector<std::uint8_t> image;
       ContinuationDiskEventReason failure_reason =
           ContinuationDiskEventReason::kCorrupt;
-      if (!ReadImage(candidate->filename, &image, &failure_reason)) {
+      // Evicted snapshots written back past the staging budget are read here
+      // too; startup indexing keeps the staging cap to bound load time.
+      if (!ReadImage(candidate->filename, &image, &failure_reason, nullptr,
+                     true)) {
         const std::size_t file_bytes = candidate->file_bytes;
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
@@ -1346,6 +1358,7 @@ struct ContinuationDiskStore::Impl {
   std::condition_variable queue_changed;
   std::deque<PendingSave> pending;
   std::size_t queued_bytes{0};
+  bool evicted_pending{false};
   std::shared_ptr<std::atomic<std::size_t>> capture_bytes =
       std::make_shared<std::atomic<std::size_t>>(0);
   bool stopping{false};
@@ -1435,6 +1448,28 @@ std::size_t ContinuationDiskStore::SaveAsync(
   }
   impl_->queue_changed.notify_one();
   return file_bytes;
+}
+
+bool ContinuationDiskStore::SaveEvicted(
+    std::shared_ptr<const TextModelRunner> runner,
+    std::vector<TextRunnerToken> checkpoint_tokens,
+    std::shared_ptr<const TextRunnerSnapshot> snapshot,
+    std::vector<std::uint8_t> input_identity) {
+  if (!runner || !snapshot || checkpoint_tokens.empty())
+    return false;
+  {
+    std::lock_guard lock(impl_->queue_mutex);
+    if (impl_->stopping || impl_->evicted_pending)
+      return false;
+    impl_->evicted_pending = true;
+    // Not charged to queued_bytes: the snapshot was already paid for by the
+    // RAM pool and must not block ordinary staged saves.
+    impl_->pending.push_back({std::move(runner), std::move(checkpoint_tokens),
+                              std::move(snapshot), std::move(input_identity),
+                              0, true});
+  }
+  impl_->queue_changed.notify_one();
+  return true;
 }
 
 void ContinuationDiskStore::Flush() {

@@ -395,6 +395,26 @@ int flock(int fd, int operation) {
   return 0;
 }
 
+char* mkdtemp(char* tmpl) {
+  // Same XXXXXX contract as POSIX; retries on a name collision.
+  const size_t length = tmpl ? strlen(tmpl) : 0;
+  if (length < 6 || strcmp(tmpl + length - 6, "XXXXXX") != 0) {
+    errno = EINVAL;
+    return nullptr;
+  }
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    memcpy(tmpl + length - 6, "XXXXXX", 6);
+    if (_mktemp_s(tmpl, length + 1) != 0)
+      return nullptr;
+    if (_mkdir(tmpl) == 0)
+      return tmpl;
+    if (errno != EEXIST)
+      return nullptr;
+  }
+  errno = EEXIST;
+  return nullptr;
+}
+
 int mkstemp(char* tmpl) {
   const size_t n = strlen(tmpl);
   for (int attempt = 0; attempt < 100; ++attempt) {
@@ -577,11 +597,21 @@ int unlinkat(int dirfd, const char* path, int flags) {
     return -1;
   return (flags & AT_REMOVEDIR) ? _wrmdir(full.c_str()) : _wunlink(full.c_str());
 }
-int fstatat(int dirfd, const char* path, struct _stat64* st, int) {
+int fstatat(int dirfd, const char* path, struct _stat64* st, int flags) {
   std::wstring full;
   if (!AtPath(dirfd, path, &full))
     return -1;
-  return _wstat64(full.c_str(), st);
+  if (_wstat64(full.c_str(), st) != 0)
+    return -1;
+  // _wstat64 follows links. With AT_SYMLINK_NOFOLLOW a reparse point (symlink,
+  // junction) must not look like the regular file it points at.
+  if ((flags & AT_SYMLINK_NOFOLLOW) != 0) {
+    const DWORD attributes = GetFileAttributesW(full.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+      st->st_mode = static_cast<unsigned short>((st->st_mode & ~_S_IFMT) | 0xA000);
+  }
+  return 0;
 }
 int utimensat(int dirfd, const char* path, const struct timespec times[2], int) {
   std::wstring full;
@@ -592,6 +622,22 @@ int utimensat(int dirfd, const char* path, const struct timespec times[2], int) 
     return -1;
   }
   return _wutime64(full.c_str(), nullptr);
+}
+static int MarkReparse(DWORD attributes, struct _stat64* st) {
+  if (attributes != INVALID_FILE_ATTRIBUTES &&
+      (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    st->st_mode = static_cast<unsigned short>((st->st_mode & ~_S_IFMT) | 0xA000);
+  return 0;
+}
+int gufo_lstat_w(const wchar_t* path, struct _stat64* st) {
+  if (_wstat64(path, st) != 0)
+    return -1;
+  return MarkReparse(GetFileAttributesW(path), st);
+}
+int gufo_lstat_a(const char* path, struct _stat64* st) {
+  if (_stat64(path, st) != 0)
+    return -1;
+  return MarkReparse(GetFileAttributesA(path), st);
 }
 int geteuid(void) { return 0; }
 int mincore(void*, size_t, unsigned char*) { errno = ENOSYS; return -1; }
