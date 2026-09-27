@@ -17,6 +17,8 @@
 
 #include <map>
 #include <mutex>
+#include <string>
+#include <sys/utime.h>
 
 namespace {
 
@@ -168,10 +170,20 @@ int gufo_open_wide(const wchar_t* path, int flags, int mode) {
     flags &= ~O_DIRECT;
   }
   if (flags & O_DIRECTORY) {
-    errno = ENOTSUP;
-    return -1;
+    // A directory handle (backup semantics) backs the *at() calls below.
+    HANDLE h = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+      SetErrnoFromWin32(GetLastError());
+      return -1;
+    }
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDONLY | _O_BINARY);
+    if (fd < 0)
+      CloseHandle(h);
+    return fd;
   }
-  return _wopen(path, flags | _O_BINARY, mode);
+  return _wopen(path, (flags & ~O_DIRECTORY) | _O_BINARY, mode);
 }
 
 int gufo_reopen_direct(int fd) {
@@ -495,11 +507,92 @@ int pipe(int fds[2]) {
   return _pipe(fds, 65536, _O_BINARY | _O_NOINHERIT);
 }
 
-int openat(int, const char*, int, ...) { errno = ENOSYS; return -1; }
-int renameat(int, const char*, int, const char*) { errno = ENOSYS; return -1; }
-int unlinkat(int, const char*, int) { errno = ENOSYS; return -1; }
-int fstatat(int, const char*, struct _stat64*, int) { errno = ENOSYS; return -1; }
-int utimensat(int, const char*, const struct timespec[2], int) { errno = ENOSYS; return -1; }
+}  // extern "C"
+
+namespace {
+// Resolves a *at() path: relative UTF-8 names join the directory the
+// descriptor was opened on (gufo_open_wide with O_DIRECTORY).
+bool AtPath(int dirfd, const char* path, std::wstring* out) {
+  if (path == nullptr) {
+    errno = EINVAL;
+    return false;
+  }
+  const int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
+  if (n <= 0) {
+    errno = EINVAL;
+    return false;
+  }
+  std::wstring name(static_cast<size_t>(n - 1), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, path, -1, &name[0], n);
+  const bool absolute = name.size() > 1 && (name[1] == L':' || name[0] == L'\\' || name[0] == L'/');
+  if (dirfd == AT_FDCWD || absolute) {
+    *out = std::move(name);
+    return true;
+  }
+  HANDLE h = FdHandle(dirfd);
+  if (h == INVALID_HANDLE_VALUE) {
+    errno = EBADF;
+    return false;
+  }
+  wchar_t directory[32768];
+  const DWORD length = GetFinalPathNameByHandleW(h, directory, 32768, FILE_NAME_NORMALIZED);
+  if (length == 0 || length >= 32768) {
+    SetErrnoFromWin32(GetLastError());
+    return false;
+  }
+  *out = std::wstring(directory, length) + L"\\" + name;
+  return true;
+}
+}  // namespace
+
+extern "C" {
+
+int openat(int dirfd, const char* path, int flags, ...) {
+  int mode = _S_IREAD | _S_IWRITE;
+  if (flags & _O_CREAT) {
+    va_list args;
+    va_start(args, flags);
+    mode = va_arg(args, int);
+    va_end(args);
+  }
+  std::wstring full;
+  if (!AtPath(dirfd, path, &full))
+    return -1;
+  return gufo_open_wide(full.c_str(), flags, mode);
+}
+int renameat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath) {
+  std::wstring from, to;
+  if (!AtPath(olddirfd, oldpath, &from) || !AtPath(newdirfd, newpath, &to))
+    return -1;
+  if (!MoveFileExW(from.c_str(), to.c_str(),
+                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    SetErrnoFromWin32(GetLastError());
+    return -1;
+  }
+  return 0;
+}
+int unlinkat(int dirfd, const char* path, int flags) {
+  std::wstring full;
+  if (!AtPath(dirfd, path, &full))
+    return -1;
+  return (flags & AT_REMOVEDIR) ? _wrmdir(full.c_str()) : _wunlink(full.c_str());
+}
+int fstatat(int dirfd, const char* path, struct _stat64* st, int) {
+  std::wstring full;
+  if (!AtPath(dirfd, path, &full))
+    return -1;
+  return _wstat64(full.c_str(), st);
+}
+int utimensat(int dirfd, const char* path, const struct timespec times[2], int) {
+  std::wstring full;
+  if (!AtPath(dirfd, path, &full))
+    return -1;
+  if (times != nullptr) {  // only "now" is used by Gufo
+    errno = ENOTSUP;
+    return -1;
+  }
+  return _wutime64(full.c_str(), nullptr);
+}
 int geteuid(void) { return 0; }
 int mincore(void*, size_t, unsigned char*) { errno = ENOSYS; return -1; }
 int dprintf(int fd, const char* format, ...) {

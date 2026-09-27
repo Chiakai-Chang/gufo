@@ -67,9 +67,12 @@ gufo.exe serve llm -m <first-shard>.gguf --mmproj <mmproj>.gguf ^
   - chat requests accept `stop` (streaming holds back a possible stop prefix and ends generation at the match), `logprobs`, `top_logprobs`, `response_format` and `modalities: ["text"]`. Fields Gufo cannot honour exactly are logged as `ignored=`.
   - Agent clients such as Hermes probe these and use `response_format` for title generation.
 
+- **`--cache-disk DIR`** works on Windows: the `*at()` calls it uses are implemented on a directory handle (`FILE_FLAG_BACKUP_SEMANTICS`). Put the directory on an NVMe drive.
+- **Request logs** carry `client=<address>` on every line.
+
 ## Not supported on Windows yet
 
-`--cache-disk`, FFmpeg-based media and video generation, and the DeepSeek V4 Flash snapshot path (`fmemopen`).
+FFmpeg-based media and video generation, and the DeepSeek V4 Flash snapshot path (`fmemopen`).
 
 ## Measured on this box (same-batch A/B)
 
