@@ -3530,6 +3530,12 @@ __launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
           }
         }
       }
+#if __clang_major__ >= 23
+      // LLVM 23 hoists the next K block's operands above this one's WMMAs,
+      // which spills registers on gfx1151. ROCm 7.2.3 (LLVM 22) does not, and
+      // the fence costs it about 3%.
+      __builtin_amdgcn_sched_barrier(0);
+#endif
     }
     __syncthreads();
   }

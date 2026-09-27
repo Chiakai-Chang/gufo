@@ -1,6 +1,7 @@
 #include "src/cli/serve/http_server.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -36,6 +37,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -47,6 +49,44 @@
 
 namespace gufo::server {
 namespace {
+
+std::atomic<int> shutdown_signal{0};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+void RequestShutdown(int signal) noexcept {
+  // A signal may arrive on any model/HTTP worker. Only a lock-free atomic
+  // operation belongs here; socket shutdown and joins run in the accept loop.
+  shutdown_signal.store(signal, std::memory_order_relaxed);
+}
+
+class ShutdownSignals {
+public:
+  ShutdownSignals() {
+    shutdown_signal.store(0, std::memory_order_relaxed);
+    struct sigaction action{};
+    action.sa_handler = RequestShutdown;
+    ::sigemptyset(&action.sa_mask);
+    if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0)
+      throw std::system_error(errno, std::generic_category(),
+                              "install SIGINT handler");
+    if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
+      const int error = errno;
+      (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
+      throw std::system_error(error, std::generic_category(),
+                              "install SIGTERM handler");
+    }
+  }
+  ~ShutdownSignals() {
+    (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
+    (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
+  }
+  ShutdownSignals(const ShutdownSignals&) = delete;
+  ShutdownSignals& operator=(const ShutdownSignals&) = delete;
+
+private:
+  struct sigaction previous_interrupt_{};
+  struct sigaction previous_terminate_{};
+};
 
 // ---------------------------------------------------------------------------
 // Socket I/O helpers
@@ -393,10 +433,30 @@ bool ReadTextContent(const json::Value* content, std::string* out) {
 }
 
 bool ReadTextMessages(const json::Value* input,
-                      std::vector<tokenization::ChatMessage>* messages) {
+                      std::vector<tokenization::ChatMessage>* messages,
+                      bool responses = false) {
   if (input == nullptr || !input->is_array() || input->empty())
     return false;
   for (const auto& item : input->items()) {
+    if (responses && item.member_str("type") == "reasoning") {
+      const auto* summary = item.find("summary");
+      const auto* encrypted = item.find("encrypted_content");
+      if (summary == nullptr || !summary->is_array() ||
+          (encrypted != nullptr && !encrypted->is_null()) ||
+          item.contains("content"))
+        return false;
+      tokenization::ChatMessage reasoning;
+      reasoning.role = tokenization::ChatRole::kAssistant;
+      for (const auto& part : summary->items()) {
+        const auto* text = part.find("text");
+        if (part.member_str("type") != "summary_text" || text == nullptr ||
+            !text->is_string())
+          return false;
+        reasoning.thought += text->str();
+      }
+      messages->push_back(std::move(reasoning));
+      continue;
+    }
     const auto role = item.member_str("role");
     if (!item.is_object() ||
         (role != "user" && role != "assistant" && role != "system" &&
@@ -409,7 +469,14 @@ bool ReadTextMessages(const json::Value* input,
     message.role = RoleFrom(role);
     if (!ReadTextContent(item.find("content"), &message.content))
       return false;
-    messages->push_back(std::move(message));
+    if (responses && message.role == tokenization::ChatRole::kAssistant &&
+        !messages->empty() &&
+        messages->back().role == tokenization::ChatRole::kAssistant &&
+        messages->back().content.empty() && !messages->back().thought.empty()) {
+      messages->back().content = std::move(message.content);
+    } else {
+      messages->push_back(std::move(message));
+    }
   }
   return true;
 }
@@ -419,12 +486,13 @@ HttpResponse InvalidCompatibilityRequest(std::string_view message) {
              "invalid_request_error", "invalid_request");
 }
 
-// Compatibility routes implement a synchronous text subset. Validate options
-// before dispatch so a client never gets an answer to a different request.
+// Validate the text subset before dispatch so a client never gets an answer
+// to a different request. Responses also supports streamed output.
 std::optional<HttpResponse> ReadCompatibilityOptions(
     const json::Value& body, TextGenerationBackend& backend,
     std::string_view token_field, std::size_t* max_tokens,
-    sampling::SamplingConfig* sampling_config) {
+    sampling::SamplingConfig* sampling_config, std::string_view stop_field = {},
+    bool allow_stream = false) {
   if (!body.is_object())
     return InvalidCompatibilityRequest("request body must be an object");
   if (const auto* model = body.find("model"); model != nullptr) {
@@ -437,7 +505,9 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   }
   for (const std::string field : {"stream", "echo", "store", "background"}) {
     if (const auto* value = body.find(field);
-        value != nullptr && (!value->is_bool() || value->as_bool())) {
+        value != nullptr &&
+        (!value->is_bool() ||
+         (value->as_bool() && !(allow_stream && field == "stream")))) {
       return InvalidCompatibilityRequest("'" + field + "' must be false");
     }
   }
@@ -458,6 +528,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
                                   "tool_choice",
                                   "parallel_tool_calls",
                                   "response_format",
+                                  "output_config",
                                   "text",
                                   "reasoning",
                                   "reasoning_effort",
@@ -469,7 +540,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
                                   "truncation",
                                   "modalities",
                                   "audio"}) {
-    if (body.contains(field)) {
+    if (field != stop_field && body.contains(field)) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
     }
@@ -588,9 +659,13 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
   if (auto error = ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
-                                            &sampling_config)) {
+                                            &sampling_config, "stop")) {
     return std::move(*error);
   }
+  std::vector<std::string> stop_sequences;
+  if (const auto error = ParseStopSequences(
+          body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
+    return InvalidCompatibilityRequest(*error);
 
   const auto* input = body.find("prompt");
   if (input == nullptr || !input->is_string()) {
@@ -602,8 +677,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  const auto res = b.complete(prompt, max_tokens, sampling_config,
-                              req.is_cancelled, {}, req.client_id);
+  const auto res =
+      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
+                 req.client_id, stop_sequences);
 
   json::Value resp = json::Value::object();
   resp["id"] = "cmpl-" + RandomId();
@@ -644,8 +720,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
 
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
-  if (auto error = ReadCompatibilityOptions(body, b, "max_output_tokens",
-                                            &max_tokens, &sampling_config)) {
+  if (auto error =
+          ReadCompatibilityOptions(body, b, "max_output_tokens", &max_tokens,
+                                   &sampling_config, {}, true)) {
     return std::move(*error);
   }
 
@@ -660,50 +737,19 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   const auto* input = body.find("input");
   if (input != nullptr && input->is_string() && !input->str().empty()) {
     messages.push_back({tokenization::ChatRole::kUser, input->str(), "", ""});
-  } else if (!ReadTextMessages(input, &messages)) {
+  } else if (!ReadTextMessages(input, &messages, true)) {
     return InvalidCompatibilityRequest(
-        "'input' must be nonempty text or text messages; use "
+        "'input' must be nonempty text, text messages or Gufo reasoning items; "
+        "use "
         "/v1/chat/completions for images and tools");
   }
 
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
-
-  json::Value resp = json::Value::object();
-  resp["id"] = "resp_" + RandomId();
-  resp["object"] = "response";
-  const bool limited =
-      res.finish_reason == TextGenerationBackend::FinishReason::kLength;
-  resp["status"] = limited ? "incomplete" : "completed";
-  resp["incomplete_details"] = json::Value();
-  if (limited) {
-    resp["incomplete_details"]["reason"] = "max_output_tokens";
-  }
-  resp["model"] = b.model_id();
-  json::Value output = json::Value::array();
-  json::Value msg = json::Value::object();
-  msg["type"] = "message";
-  msg["id"] = "msg_" + RandomId();
-  msg["role"] = "assistant";
-  json::Value content = json::Value::array();
-  json::Value txt = json::Value::object();
-  txt["type"] = "output_text";
-  txt["text"] = core::Utf8Decoder{}.Push(res.text, true);
-  content.push_back(std::move(txt));
-  msg["content"] = std::move(content);
-  output.push_back(std::move(msg));
-  resp["output"] = std::move(output);
-  json::Value usage = json::Value::object();
-  usage["input_tokens"] = res.prompt_tokens;
-  usage["output_tokens"] = res.completion_tokens;
-  usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
-  json::Value input_details = json::Value::object();
-  input_details["cached_tokens"] = res.cached_prompt_tokens;
-  usage["input_tokens_details"] = std::move(input_details);
-  resp["usage"] = std::move(usage);
-  resp["timings"] = GenerationTimings(res);
-  return WithTiming(Ok(resp), res);
+  chat.reasoning = b.reasoning_defaults();
+  return CreateOpenAiResponse(
+      req, b, chat, max_tokens, sampling_config,
+      body.find("stream") != nullptr && body.find("stream")->as_bool());
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -724,8 +770,9 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
 
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
-  if (auto error = ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
-                                            &sampling_config)) {
+  if (auto error =
+          ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
+                                   &sampling_config, "stop_sequences")) {
     return std::move(*error);
   }
 
@@ -746,6 +793,11 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
 
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
+  chat.reasoning = b.reasoning_defaults();
+  if (const auto error = ParseStopSequences(body.find("stop_sequences"),
+                                            StopSequenceFormat::kAnthropic,
+                                            &chat.stop_sequences))
+    return InvalidCompatibilityRequest(*error);
   const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
@@ -762,8 +814,13 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   resp["stop_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength
           ? "max_tokens"
+      : res.finish_reason == TextGenerationBackend::FinishReason::kStopSequence
+          ? "stop_sequence"
           : "end_turn";
-  resp["stop_sequence"] = json::Value();
+  resp["stop_sequence"] =
+      res.finish_reason == TextGenerationBackend::FinishReason::kStopSequence
+          ? json::Value(res.stop_sequence)
+          : json::Value();
   json::Value usage = json::Value::object();
   usage["input_tokens"] = res.prompt_tokens;
   usage["output_tokens"] = res.completion_tokens;
@@ -793,7 +850,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
   if (auto error = ReadCompatibilityOptions(body, b, "n_predict", &max_tokens,
-                                            &sampling_config)) {
+                                            &sampling_config, "stop")) {
     return std::move(*error);
   }
 
@@ -802,20 +859,27 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
     return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
   }
   const std::string prompt = input->str();
+  std::vector<std::string> stop_sequences;
+  if (const auto error = ParseStopSequences(
+          body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
+    return InvalidCompatibilityRequest(*error);
 
-  const auto res = b.complete(prompt, max_tokens, sampling_config,
-                              req.is_cancelled, {}, req.client_id);
+  const auto res =
+      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
+                 req.client_id, stop_sequences);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
   resp["stop"] = true;
   const bool limited =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength;
-  resp["stopped_eos"] = !limited && !res.cancelled;
+  const bool matched =
+      res.finish_reason == TextGenerationBackend::FinishReason::kStopSequence;
+  resp["stopped_eos"] = !limited && !res.cancelled && !matched;
   resp["stopped_length"] = limited;
-  resp["stopped_word"] = false;
+  resp["stopped_word"] = matched;
   resp["stopped_limit"] = limited;
-  resp["stopping_word"] = "";
+  resp["stopping_word"] = res.stop_sequence;
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
   resp["tokens_cached"] = res.cached_prompt_tokens;
@@ -1063,7 +1127,17 @@ bool HttpServer::start(std::string* error) {
   return true;
 }
 
-void HttpServer::run() {
+void HttpServer::run(bool handle_signals) {
+  std::optional<ShutdownSignals> signals;
+  if (handle_signals) {
+    signals.emplace();
+    // A connection may disappear between poll and accept. Never let that
+    // race put the signal-aware loop back into an uninterruptible accept.
+    const int flags = ::fcntl(listen_fd_, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK) != 0)
+      throw std::system_error(errno, std::generic_category(),
+                              "configure HTTP listener");
+  }
   Logger::Info(
       "server",
       "event=listening address=http://" + host_ + ":" + std::to_string(port_) +
@@ -1071,6 +1145,22 @@ void HttpServer::run() {
           " max_connections=" + std::to_string(options_.max_connections) +
           " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
   while (!stopped_.load(std::memory_order_acquire)) {
+    if (handle_signals) {
+      const int signal = shutdown_signal.load(std::memory_order_relaxed);
+      if (signal != 0) {
+        Logger::Info("server", "event=shutdown_requested signal=" +
+                                   std::to_string(signal));
+        stop();
+        break;
+      }
+      pollfd descriptor{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+      const int ready = ::poll(&descriptor, 1, 100);
+      if (ready < 0 && errno != EINTR)
+        throw std::system_error(errno, std::generic_category(),
+                                "poll HTTP listener");
+      if (ready <= 0)
+        continue;
+    }
     const int client_fd = platform::AcceptSocket(listen_fd_);
     if (client_fd < 0) {
       if (stopped_.load(std::memory_order_acquire)) {
@@ -1426,11 +1516,11 @@ void HttpServer::handle_connection(int client_fd) {
                                             : SendAll(client_fd, chunk));
           return connected;
         });
-        // Without the final chunk, HTTP clients report an incomplete body.
-        // Closing an unframed PCM stream would silently look like shorter
-        // audio.
+        // An SSE error is a complete protocol response. A failed raw PCM
+        // stream must remain incomplete, or it looks like valid shorter audio.
         if (connected && chunked &&
-            (!resp.stream_log || resp.stream_log->error_code.empty()))
+            (!resp.stream_log || resp.stream_log->error_code.empty() ||
+             resp.stream_log->error_event_sent))
           connected = SendAll(client_fd, "0\r\n\r\n");
       }
     } else {

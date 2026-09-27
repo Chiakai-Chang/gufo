@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/stop_sequences.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
@@ -39,8 +40,6 @@ struct ParsedChatRequest {
   sampling::SamplingConfig sampling;
   bool stream{false};
   bool include_usage{false};
-  /// OpenAI "stop" strings, applied to content (not reasoning).
-  std::vector<std::string> stop;
   /// Accepted-but-ignored fields, reported in the request log.
   std::string ignored_fields;
 };
@@ -55,6 +54,7 @@ struct ParsedGeneration {
   std::string text;
   std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
+  bool hide_tool_markup{false};
 };
 
 constexpr std::array<std::string_view, 7> kToolMarkers{
@@ -307,7 +307,7 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
 bool ParseTools(const json::Value* tools,
                 std::vector<tokenization::ChatTool>* output,
                 std::string* error) {
-  if (tools == nullptr) {
+  if (tools == nullptr || tools->is_null()) {
     return true;
   }
   if (!tools->is_array()) {
@@ -315,26 +315,58 @@ bool ParseTools(const json::Value* tools,
     return false;
   }
   for (const auto& item : tools->items()) {
-    if (!item.is_object() || item.member_str("type") != "function") {
+    if (!item.is_object()) {
+      *error = "'tools' entries must be objects";
+      return false;
+    }
+    if (item.member_str("type") != "function") {
       *error = "only function tools are supported";
       return false;
     }
+
     const json::Value* function = item.find("function");
-    if (function == nullptr || !function->is_object()) {
-      *error = "function tools require a function object";
+    if (function != nullptr && !function->is_object()) {
+      *error = "'function' must be an object";
       return false;
     }
+    const json::Value* src = function != nullptr ? function : &item;
+    // OpenAI uses "parameters"; some agent clients send parametersJsonSchema.
+    const json::Value* params_src = src->find("parameters");
+    if (params_src == nullptr || params_src->is_null()) {
+      params_src = src->find("parametersJsonSchema");
+    }
+
     tokenization::ChatTool tool;
-    tool.name = function->member_str("name");
-    tool.description = function->member_str("description");
-    const json::Value* parameters = function->find("parameters");
-    if (tool.name.empty() || parameters == nullptr ||
-        !parameters->is_object()) {
-      *error = "function tools require a name and object parameters schema";
+    tool.name = src->member_str("name");
+    tool.description = src->member_str("description");
+    if (tool.name.empty()) {
+      *error = "function tools require a nonempty name";
       return false;
     }
-    tool.parameters_json = parameters->dump();
-    tool.definition_json = item.dump();
+    if (params_src != nullptr && !params_src->is_null() &&
+        !params_src->is_object()) {
+      *error = "function tools require an object parameters schema";
+      return false;
+    }
+    // Preserve nested definitions and their field order. For flat tools, move
+    // the complete function body (including strict) under "function".
+    json::Value function_obj = json::Value::object();
+    for (const auto& [key, value] : src->members()) {
+      if (key == "parametersJsonSchema" ||
+          (function == nullptr && key == "type")) {
+        continue;
+      }
+      function_obj.append_member(key, value);
+    }
+    function_obj["parameters"] =
+        params_src != nullptr && params_src->is_object()
+            ? *params_src
+            : json::Value::object();
+    tool.parameters_json = function_obj.find("parameters")->dump();
+    json::Value definition = function != nullptr ? item : json::Value::object();
+    definition["type"] = "function";
+    definition["function"] = std::move(function_obj);
+    tool.definition_json = definition.dump();
     output->push_back(std::move(tool));
   }
   return true;
@@ -342,7 +374,7 @@ bool ParseTools(const json::Value* tools,
 
 bool ParseToolChoice(const json::Value* value, ParsedChatRequest* request,
                      std::string* error) {
-  if (value == nullptr) {
+  if (value == nullptr || value->is_null()) {
     return true;
   }
   if (value->is_string()) {
@@ -439,7 +471,8 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
     }
   }
 
-  if (const json::Value* effort = body.find("reasoning_effort")) {
+  if (const json::Value* effort = body.find("reasoning_effort");
+      effort != nullptr && !effort->is_null()) {
     if (!effort->is_string() ||
         !AssignReasoningEffort(options, effort->get_str(), error)) {
       if (error->empty()) {
@@ -540,6 +573,11 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     }
     output->chat.cache_prompt = cache_prompt->as_bool();
   }
+  if (const auto error =
+          ParseStopSequences(body.find("stop"), StopSequenceFormat::kOpenAi,
+                             &output->chat.stop_sequences)) {
+    return Error(400, "Bad Request", *error, "invalid_stop");
+  }
 
   const json::Value* messages = body.find("messages");
   if (messages == nullptr || !messages->is_array() || messages->empty()) {
@@ -595,14 +633,16 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     output->chat.reasoning.preserve_thinking = defaults.preserve_thinking;
   }
 
-  if (const json::Value* stream = body.find("stream")) {
+  if (const json::Value* stream = body.find("stream");
+      stream != nullptr && !stream->is_null()) {
     if (!stream->is_bool()) {
       return Error(400, "Bad Request", "'stream' must be a boolean",
                    "invalid_stream");
     }
     output->stream = stream->as_bool();
   }
-  if (const json::Value* options = body.find("stream_options")) {
+  if (const json::Value* options = body.find("stream_options");
+      options != nullptr && !options->is_null()) {
     if (!options->is_object()) {
       return Error(400, "Bad Request", "'stream_options' must be an object",
                    "invalid_stream_options");
@@ -618,10 +658,10 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
 
   const json::Value* max_tokens = body.find("max_completion_tokens");
-  if (max_tokens == nullptr) {
+  if (max_tokens == nullptr || max_tokens->is_null()) {
     max_tokens = body.find("max_tokens");
   }
-  if (max_tokens != nullptr) {
+  if (max_tokens != nullptr && !max_tokens->is_null()) {
     const double value =
         max_tokens->is_number() ? max_tokens->as_double() : 0.0;
     if (!max_tokens->is_number() || !std::isfinite(value) ||
@@ -648,7 +688,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   output->sampling = parsed_sampling;
 
   if (const json::Value* choices = body.find("n");
-      choices != nullptr &&
+      choices != nullptr && !choices->is_null() &&
       (!choices->is_number() || choices->as_double() != 1.0)) {
     return Error(400, "Bad Request", "only n=1 is supported", "unsupported_n");
   }
@@ -696,21 +736,6 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
         ignore("response_format:" + type);  // no grammar constraint in Gufo
     }
   }
-  if (const json::Value* stop = body.find("stop")) {
-    if (stop->is_string()) {
-      if (!stop->get_str().empty())
-        output->stop.push_back(stop->get_str());
-    } else if (stop->is_array()) {
-      for (const json::Value& item : stop->items()) {
-        if (!item.is_string())
-          return Error(400, "Bad Request", "'stop' entries must be strings", "invalid_stop");
-        if (!item.get_str().empty())
-          output->stop.push_back(item.get_str());
-      }
-    } else if (!stop->is_null()) {
-      return Error(400, "Bad Request", "'stop' must be a string or an array", "invalid_stop");
-    }
-  }
   return std::nullopt;
 }
 
@@ -724,6 +749,59 @@ std::string_view Trim(std::string_view value) {
     value.remove_suffix(1);
   }
   return value;
+}
+
+// Qwen writes a parameter as "<parameter=name>\nVALUE\n</parameter>": one
+// newline on each side is framing, everything else (a file's final newline,
+// indentation, blank lines) belongs to the value.
+std::string_view StripFramingNewlines(std::string_view value) {
+  if (value.starts_with("\r\n"))
+    value.remove_prefix(2);
+  else if (value.starts_with('\n'))
+    value.remove_prefix(1);
+  if (value.ends_with("\r\n"))
+    value.remove_suffix(2);
+  else if (value.ends_with('\n'))
+    value.remove_suffix(1);
+  return value;
+}
+
+// Qwen's XML-like calls look like Python keyword arguments, and the models
+// sometimes write Python's True, False and None where the schema asks for a
+// JSON boolean or null. Rewrites those words outside JSON string literals.
+std::string PythonLiteralsToJson(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  bool in_string = false;
+  for (std::size_t i = 0; i < value.size();) {
+    const char c = value[i];
+    if (in_string) {
+      const std::size_t length = c == '\\' && i + 1 < value.size() ? 2 : 1;
+      out += value.substr(i, length);
+      in_string = c != '"';
+      i += length;
+      continue;
+    }
+    if (std::isalpha(static_cast<unsigned char>(c)) == 0) {
+      out += c;
+      in_string = c == '"';
+      ++i;
+      continue;
+    }
+    std::size_t word_end = i;
+    while (word_end < value.size() &&
+           (std::isalnum(static_cast<unsigned char>(value[word_end])) != 0 ||
+            value[word_end] == '_')) {
+      ++word_end;
+    }
+    const auto word = value.substr(i, word_end - i);
+    out += word == "True"    ? std::string_view{"true"}
+           : word == "False" ? std::string_view{"false"}
+           : word == "None"  ? std::string_view{"null"}
+                             : word;
+    i = word_end;
+  }
+  return out;
 }
 
 std::optional<json::Value> TryParseJson(std::string_view value) noexcept {
@@ -871,35 +949,33 @@ void ParseQwenCalls(std::string_view text,
           valid = false;
           break;
         }
-        std::string_view raw = Trim(body.substr(0, close));
+        const auto value = StripFramingNewlines(body.substr(0, close));
         const auto* properties = schema ? schema->find("properties") : nullptr;
         const auto* property = properties ? properties->find(name) : nullptr;
         const bool string_allowed =
             !property ||
-            SchemaAccepts(*property, json::Value(std::string(raw)));
+            SchemaAccepts(*property, json::Value(std::string(value)));
         // Prefer text if the schema permits it; parsing ambiguous scalars
         // as JSON would silently change a caller's declared string type.
         bool is_string = string_allowed;
+        std::string raw(is_string ? value : Trim(value));
         if (!is_string) {
-          // Models often write Python literals (True/False/None).
-          const auto lower = [&] {
-            std::string out(raw);
-            for (char& c : out)
-              c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            return out;
-          }();
-          if (lower == "true" || lower == "false")
-            raw = lower == "true" ? "true" : "false";
-          else if (lower == "none" || lower == "null")
-            raw = "null";
-          const auto parsed = TryParseJson(raw);
-          // A value the schema rejects is passed through as a string, as
-          // llama-server does: the client can answer with a validation error
-          // the model can fix, whereas dropping the call left an empty reply.
-          is_string = !parsed || !SchemaAccepts(*property, *parsed);
+          auto parsed = TryParseJson(raw);
+          if (!parsed || !SchemaAccepts(*property, *parsed)) {
+            raw = PythonLiteralsToJson(raw);
+            parsed = TryParseJson(raw);
+          }
+          // A value the schema still rejects is passed through as a string,
+          // as llama-server does: the client can answer with a validation
+          // error the model can fix, whereas dropping the call left an empty
+          // reply.
+          if (!parsed || !SchemaAccepts(*property, *parsed)) {
+            raw = std::string(Trim(value));
+            is_string = true;
+          }
         }
         call.arguments.push_back(
-            {.name = name, .value = std::string(raw), .is_string = is_string});
+            {.name = name, .value = std::move(raw), .is_string = is_string});
         body.remove_prefix(close + std::string_view{"</parameter>"}.size());
       }
       // The model sometimes ends its turn right after </function>; a call
@@ -1046,7 +1122,7 @@ ParsedGeneration ParseGeneration(
     std::string_view raw,
     TextGenerationBackend::InitialOutputState initial_output_state,
     std::span<const tokenization::ChatTool> tools,
-    ChatRequest::ToolChoice choice) {
+    ChatRequest::ToolChoice choice, bool enforce_required) {
   ParsedGeneration parsed;
   std::string_view content = raw;
 
@@ -1064,7 +1140,7 @@ ParsedGeneration ParseGeneration(
       const auto marker = EarliestMarker(content);
       parsed.reasoning_content = std::string(Trim(content.substr(0, marker)));
       if (marker == std::string_view::npos) {
-        if (choice == ChatRequest::ToolChoice::kRequired)
+        if (enforce_required && choice == ChatRequest::ToolChoice::kRequired)
           throw TextGenerationError(
               TextGenerationErrorCode::kToolChoiceUnsatisfied,
               "model did not produce a declared tool call");
@@ -1130,11 +1206,15 @@ ParsedGeneration ParseGeneration(
     // result; dropping them silently left an empty reply and a retry loop.
     std::erase_if(parsed.tool_calls,
                   [](const auto& call) { return call.name.empty(); });
-    if (!parsed.tool_calls.empty()) {
+    // An explicit stop can interrupt a call before its closing tags. Keep
+    // complete calls, but do not expose an unfinished call as ordinary text.
+    if (!parsed.tool_calls.empty() || !enforce_required) {
       parsed.text = text_before_tools;
+      parsed.hide_tool_markup = true;
     }
   }
-  if (choice == ChatRequest::ToolChoice::kRequired && parsed.tool_calls.empty())
+  if (enforce_required && choice == ChatRequest::ToolChoice::kRequired &&
+      parsed.tool_calls.empty())
     throw TextGenerationError(TextGenerationErrorCode::kToolChoiceUnsatisfied,
                               "model did not produce a declared tool call");
   return parsed;
@@ -1142,6 +1222,9 @@ ParsedGeneration ParseGeneration(
 
 const char* FinishReason(const TextGenerationBackend::Result& result,
                          bool has_tool_calls) {
+  if (result.finish_reason ==
+      TextGenerationBackend::FinishReason::kStopSequence)
+    return "stop";
   if (has_tool_calls) {
     return "tool_calls";
   }
@@ -1326,11 +1409,9 @@ public:
         }
         std::string_view remaining = pending_;
         remaining.remove_prefix(end_pos + kThinkEnd.size());
-        if (!remaining.empty() && remaining.front() == '\n') {
-          remaining.remove_prefix(1);
-        }
         pending_ = std::string(remaining);
         state_ = State::kContent;
+        trim_reasoning_separator_ = true;
       } else {
         std::size_t held = HeldMarkerPrefix(pending_);
         for (std::size_t len = std::min(pending_.size(), kThinkEnd.size() - 1);
@@ -1350,6 +1431,15 @@ public:
     }
 
     if (state_ == State::kContent) {
+      if (trim_reasoning_separator_) {
+        const auto first = pending_.find_first_not_of("\r\n");
+        if (first == std::string::npos) {
+          pending_.clear();
+          return true;
+        }
+        pending_.erase(0, first);
+        trim_reasoning_separator_ = false;
+      }
       const std::size_t marker = EarliestMarker(pending_);
       if (marker != std::string::npos) {
         if (marker > 0 && !emit_piece_(pending_.substr(0, marker), false)) {
@@ -1373,7 +1463,7 @@ public:
     return true;
   }
 
-  bool Finish(bool valid_tool_calls) {
+  bool Finish(bool hide_tool_markup) {
     if (!tool_mode_) {
       if (!pending_.empty()) {
         const bool is_reasoning = (state_ == State::kThinking);
@@ -1383,7 +1473,7 @@ public:
       }
       return true;
     }
-    if (!valid_tool_calls && !hidden_.empty()) {
+    if (!hide_tool_markup && !hidden_.empty()) {
       return emit_piece_(hidden_, false);
     }
     return true;
@@ -1405,6 +1495,181 @@ private:
   std::string hidden_;
   State state_{State::kInitial};
   bool tool_mode_{false};
+  bool trim_reasoning_separator_{false};
+};
+
+// Responses uses semantic SSE events, rather than Chat Completions chunks.
+// Build the same output items for streaming and buffered responses.
+class ResponsesOutput {
+public:
+  ResponsesOutput(std::string model, HttpResponse::BodyWriter writer)
+      : writer_(std::move(writer)) {
+    response_ = json::Value::object();
+    response_["id"] = RandomId("resp_");
+    response_["object"] = "response";
+    response_["created_at"] = Now();
+    response_["model"] = std::move(model);
+    response_["status"] = "in_progress";
+    response_["error"] = json::Value();
+    response_["incomplete_details"] = json::Value();
+    response_["usage"] = json::Value();
+    response_["output"] = json::Value::array();
+    response_["store"] = false;
+    response_["parallel_tool_calls"] = false;
+    response_["tool_choice"] = "none";
+    response_["tools"] = json::Value::array();
+  }
+
+  bool Begin() {
+    return Lifecycle("response.created") && Lifecycle("response.in_progress");
+  }
+
+  bool Append(std::string_view text, bool reasoning) {
+    if (text.empty())
+      return true;
+    if (!active_ || reasoning_ != reasoning) {
+      if (!CloseItem("completed"))
+        return false;
+      reasoning_ = reasoning;
+      active_ = true;
+      item_ = json::Value::object();
+      item_["id"] = RandomId(reasoning ? "rs_" : "msg_");
+      item_["type"] = reasoning ? "reasoning" : "message";
+      item_["status"] = "in_progress";
+      item_[reasoning ? "summary" : "content"] = json::Value::array();
+      if (!reasoning)
+        item_["role"] = "assistant";
+      auto added = IndexedEvent("response.output_item.added");
+      added["item"] = item_;
+      if (!Emit(std::move(added)))
+        return false;
+      text_.clear();
+      auto part = PartEvent(reasoning ? "response.reasoning_summary_part.added"
+                                      : "response.content_part.added");
+      part["part"] = Part();
+      if (!Emit(std::move(part)))
+        return false;
+    }
+    text_.append(text);
+    auto delta = PartEvent(reasoning ? "response.reasoning_summary_text.delta"
+                                     : "response.output_text.delta");
+    delta["delta"] = std::string(text);
+    if (!reasoning)
+      delta["logprobs"] = json::Value::array();
+    return Emit(std::move(delta));
+  }
+
+  json::Value Complete(const TextGenerationBackend::Result& result) {
+    const bool limited =
+        result.finish_reason == TextGenerationBackend::FinishReason::kLength;
+    CloseItem(limited ? "incomplete" : "completed");
+    response_["status"] = limited ? "incomplete" : "completed";
+    if (limited)
+      response_["incomplete_details"]["reason"] = "max_output_tokens";
+    auto usage = json::Value::object();
+    usage["input_tokens"] = result.prompt_tokens;
+    usage["input_tokens_details"]["cached_tokens"] =
+        result.cached_prompt_tokens;
+    usage["input_tokens_details"]["cache_write_tokens"] = result.prefill_tokens;
+    usage["output_tokens"] = result.completion_tokens;
+    usage["output_tokens_details"]["reasoning_tokens"] =
+        result.reasoning_tokens;
+    usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
+    response_["usage"] = std::move(usage);
+    response_["timings"] = GenerationTimings(result);
+    Lifecycle(limited ? "response.incomplete" : "response.completed");
+    return response_;
+  }
+
+  bool Fail(std::string_view message) {
+    response_["status"] = "failed";
+    // Responses defines a closed error-code enum. Keep the specific runtime
+    // code in the request log, rather than emitting an invalid wire value.
+    response_["error"]["code"] = "server_error";
+    response_["error"]["message"] = std::string(message);
+    return Lifecycle("response.failed");
+  }
+
+private:
+  json::Value IndexedEvent(std::string_view type) const {
+    auto event = json::Value::object();
+    event["type"] = std::string(type);
+    event["output_index"] = output_index_;
+    return event;
+  }
+
+  json::Value PartEvent(std::string_view type) const {
+    auto event = IndexedEvent(type);
+    event["item_id"] = item_.member_str("id");
+    event[reasoning_ ? "summary_index" : "content_index"] = 0;
+    return event;
+  }
+
+  json::Value Part() const {
+    auto part = json::Value::object();
+    part["type"] = reasoning_ ? "summary_text" : "output_text";
+    part["text"] = text_;
+    if (!reasoning_) {
+      part["annotations"] = json::Value::array();
+      part["logprobs"] = json::Value::array();
+    }
+    return part;
+  }
+
+  bool CloseItem(const char* status) {
+    if (!active_)
+      return connected_;
+    auto done = PartEvent(reasoning_ ? "response.reasoning_summary_text.done"
+                                     : "response.output_text.done");
+    done["text"] = text_;
+    if (!reasoning_)
+      done["logprobs"] = json::Value::array();
+    if (!Emit(std::move(done)))
+      return false;
+    auto part = Part();
+    auto part_done =
+        PartEvent(reasoning_ ? "response.reasoning_summary_part.done"
+                             : "response.content_part.done");
+    part_done["part"] = part;
+    if (!Emit(std::move(part_done)))
+      return false;
+    item_[reasoning_ ? "summary" : "content"].push_back(std::move(part));
+    item_["status"] = status;
+    auto item_done = IndexedEvent("response.output_item.done");
+    item_done["item"] = item_;
+    response_["output"].push_back(item_);
+    active_ = false;
+    ++output_index_;
+    return Emit(std::move(item_done));
+  }
+
+  bool Lifecycle(std::string_view type) {
+    auto event = json::Value::object();
+    event["type"] = std::string(type);
+    event["response"] = response_;
+    return Emit(std::move(event));
+  }
+
+  bool Emit(json::Value event) {
+    if (!writer_)
+      return true;
+    if (!connected_)
+      return false;
+    event["sequence_number"] = sequence_++;
+    connected_ =
+        writer_("event: " + event.member_str("type") + "\n" + Sse(event));
+    return connected_;
+  }
+
+  HttpResponse::BodyWriter writer_;
+  json::Value response_;
+  json::Value item_;
+  std::string text_;
+  std::size_t sequence_{0};
+  std::size_t output_index_{0};
+  bool active_{false};
+  bool reasoning_{false};
+  bool connected_{true};
 };
 
 // GUFO_DUMP_OUTPUT=FILE appends one JSON line per chat generation: the raw
@@ -1431,17 +1696,6 @@ void DumpOutput(std::string_view raw, const ParsedGeneration& parsed,
   out << line.dump() << "\n";
 }
 
-// Earliest occurrence of any stop string in text, or npos.
-std::size_t FindStop(std::string_view text, const std::vector<std::string>& stops) {
-  std::size_t best = std::string_view::npos;
-  for (const auto& stop : stops) {
-    const auto pos = text.find(stop);
-    if (pos < best)
-      best = pos;
-  }
-  return best;
-}
-
 HttpResponse NonStreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
@@ -1450,15 +1704,11 @@ HttpResponse NonStreamingResponse(
   core::Utf8Decoder decoder;
   ParsedGeneration generated =
       ParseGeneration(decoder.Push(result.text, true), initial_output_state,
-                      request.chat.tools, request.chat.tool_choice);
-  // Stop strings are applied after the fact here: correct output, but the
-  // model may have generated past the stop point.
-  const std::size_t stop_at = FindStop(generated.text, request.stop);
-  if (stop_at != std::string::npos)
-    generated.text.resize(stop_at);
+                      request.chat.tools, request.chat.tool_choice,
+                      result.finish_reason !=
+                          TextGenerationBackend::FinishReason::kStopSequence);
   DumpOutput(result.text, generated,
-             stop_at != std::string::npos ? "stop"
-                                          : FinishReason(result, !generated.tool_calls.empty()),
+             FinishReason(result, !generated.tool_calls.empty()),
              result.prompt_tokens);
 
   json::Value response = json::Value::object();
@@ -1483,9 +1733,7 @@ HttpResponse NonStreamingResponse(
     message["tool_calls"] = ToolCallsJson(generated.tool_calls);
   }
   choice["message"] = std::move(message);
-  choice["finish_reason"] = stop_at != std::string::npos
-                                ? "stop"
-                                : FinishReason(result, !generated.tool_calls.empty());
+  choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
@@ -1540,55 +1788,20 @@ HttpResponse StreamingResponse(
             }
 
             bool connected = true;
-            const auto send = [&](std::string_view text, bool is_reasoning) {
-              if (text.empty())
-                return connected;
-              json::Value delta = json::Value::object();
-              if (is_reasoning) {
-                delta["reasoning_content"] = std::string(text);
-              } else {
-                delta["content"] = std::string(text);
-              }
-              connected =
-                  writer(Sse(ChoiceChunk(id, created, model, std::move(delta))));
-              return connected;
-            };
-            // Stop strings: hold back a tail that could start a stop string,
-            // cut at the first full match and end the generation there.
-            std::size_t max_stop = 0;
-            for (const auto& s : request.stop)
-              max_stop = std::max(max_stop, s.size());
-            std::string held;
-            bool stopped = false;
             StreamingTextFilter filter(
                 initial_output_state,
                 [&](std::string_view text, bool is_reasoning) {
-                  if (text.empty())
+                  if (text.empty()) {
                     return true;
-                  if (is_reasoning || request.stop.empty())
-                    return send(text, is_reasoning);
-                  if (stopped)
-                    return false;
-                  held.append(text);
-                  if (const auto cut = FindStop(held, request.stop);
-                      cut != std::string::npos) {
-                    stopped = true;
-                    send(std::string_view(held).substr(0, cut), false);
-                    held.clear();
-                    return false;
                   }
-                  if (held.size() >= max_stop) {
-                    std::size_t keep = held.size() - (max_stop - 1);
-                    // Never split a UTF-8 sequence across two chunks.
-                    while (keep > 0 &&
-                           (static_cast<unsigned char>(held[keep]) & 0xC0) == 0x80)
-                      --keep;
-                    if (keep > 0) {
-                      const bool ok = send(std::string_view(held).substr(0, keep), false);
-                      held.erase(0, keep);
-                      return ok;
-                    }
+                  json::Value delta = json::Value::object();
+                  if (is_reasoning) {
+                    delta["reasoning_content"] = std::string(text);
+                  } else {
+                    delta["content"] = std::string(text);
                   }
+                  connected = writer(
+                      Sse(ChoiceChunk(id, created, model, std::move(delta))));
                   return connected;
                 });
 
@@ -1600,24 +1813,22 @@ HttpResponse StreamingResponse(
               if (!request.ignored_fields.empty())
                 stream_log->details += " ignored=" + request.ignored_fields;
               RecordServerMetrics(result);
-              if (!connected || (result.cancelled && !stopped)) {
+              if (!connected || result.cancelled) {
                 return;
               }
-              ParsedGeneration generated;
-              if (!stopped) {
-                if (!filter.Push({}, true) || stopped)
-                  return;
-                generated =
-                    ParseGeneration(filter.raw(), initial_output_state,
-                                    request.chat.tools, request.chat.tool_choice);
-                DumpOutput(filter.raw(), generated,
-                           FinishReason(result, !generated.tool_calls.empty()),
-                           result.prompt_tokens);
-                if (!filter.Finish(!generated.tool_calls.empty()))
-                  return;
-                if (!stopped && !held.empty() && !send(held, false))
-                  return;
-                held.clear();
+              if (!filter.Push({}, true))
+                return;
+
+              const ParsedGeneration generated = ParseGeneration(
+                  filter.raw(), initial_output_state, request.chat.tools,
+                  request.chat.tool_choice,
+                  result.finish_reason !=
+                      TextGenerationBackend::FinishReason::kStopSequence);
+              DumpOutput(filter.raw(), generated,
+                         FinishReason(result, !generated.tool_calls.empty()),
+                         result.prompt_tokens);
+              if (!filter.Finish(generated.hide_tool_markup)) {
+                return;
               }
               for (std::size_t index = 0; index < generated.tool_calls.size();
                    ++index) {
@@ -1643,8 +1854,7 @@ HttpResponse StreamingResponse(
               json::Value terminal_delta = json::Value::object();
               auto terminal_chunk = ChoiceChunk(
                   id, created, model, std::move(terminal_delta),
-                  stopped ? "stop"
-                          : FinishReason(result, !generated.tool_calls.empty()));
+                  FinishReason(result, !generated.tool_calls.empty()));
               // llama.cpp reports timings on the terminal choice regardless
               // of the optional OpenAI usage chunk. Proxies need these even
               // when a client does not request stream_options.include_usage.
@@ -1670,7 +1880,7 @@ HttpResponse StreamingResponse(
               detail["type"] = "server_error";
               detail["code"] = exception.stable_code();
               error["error"] = std::move(detail);
-              (void)writer(Sse(error));
+              stream_log->error_event_sent = writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
             } catch (const std::exception&) {
               stream_log->error_code = "generation_failed";
@@ -1680,7 +1890,7 @@ HttpResponse StreamingResponse(
               detail["type"] = "server_error";
               detail["code"] = "generation_failed";
               error["error"] = std::move(detail);
-              (void)writer(Sse(error));
+              stream_log->error_event_sent = writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
             }
           },
@@ -1689,6 +1899,91 @@ HttpResponse StreamingResponse(
 }
 
 }  // namespace
+
+HttpResponse CreateOpenAiResponse(const HttpRequest& request,
+                                  TextGenerationBackend& backend,
+                                  const ChatRequest& chat,
+                                  std::size_t max_tokens,
+                                  const sampling::SamplingConfig& sampling,
+                                  bool stream) {
+  const auto initial = backend.initial_output_state(chat);
+  auto generation = backend.start_chat(chat, max_tokens, sampling,
+                                       request.is_cancelled, stream);
+  auto stream_log = std::make_shared<HttpResponse::StreamLog>();
+  auto timing = std::make_shared<std::string>();
+  const auto run = [generation, initial, model = backend.model_id(), stream_log,
+                    timing](const HttpResponse::BodyWriter& writer) {
+    ResponsesOutput output(model, writer);
+    if (!output.Begin()) {
+      generation->Cancel();
+      return json::Value();
+    }
+    StreamingTextFilter filter(initial,
+                               [&](std::string_view piece, bool reasoning) {
+                                 if (output.Append(piece, reasoning))
+                                   return true;
+                                 generation->Cancel();
+                                 return false;
+                               });
+    try {
+      const auto result = writer
+                              ? generation->Wait([&](std::string_view piece) {
+                                  return filter.Push(piece);
+                                })
+                              : generation->Wait();
+      stream_log->details = GenerationLogDetails(result);
+      RecordServerMetrics(result);
+      if (!writer) {
+        std::ostringstream value;
+        value << std::fixed << std::setprecision(3)
+              << "ttft;dur=" << result.ttft_ms
+              << ", inter_token;dur=" << result.mean_inter_token_ms
+              << ", max_inter_token;dur=" << result.max_inter_token_ms;
+        *timing = value.str();
+      }
+      if (result.cancelled)
+        return json::Value();
+      if (!writer)
+        filter.Push(result.text);
+      if (!filter.Push({}, true) || !filter.Finish(false)) {
+        generation->Cancel();
+        return json::Value();
+      }
+      return output.Complete(result);
+    } catch (const std::exception& error) {
+      if (!writer)
+        throw;
+      const auto* generation_error =
+          dynamic_cast<const TextGenerationError*>(&error);
+      stream_log->error_code = generation_error
+                                   ? generation_error->stable_code()
+                                   : "generation_failed";
+      stream_log->error_event_sent =
+          output.Fail(generation_error ? error.what() : "generation failed");
+      generation->Cancel();
+      return json::Value();
+    }
+  };
+  if (stream) {
+    return {.status = 200,
+            .reason = "OK",
+            .body = {},
+            .headers = {{"Content-Type", "text/event-stream"},
+                        {"Cache-Control", "no-cache"},
+                        {"X-Accel-Buffering", "no"}},
+            .streaming_body =
+                [run](const HttpResponse::BodyWriter& writer) {
+                  (void)run(writer);
+                },
+            .stream_log = std::move(stream_log)};
+  }
+  auto response = run({});
+  return {.status = 200,
+          .reason = "OK",
+          .body = response.dump(),
+          .headers = {{"Server-Timing", *timing}},
+          .log_details = stream_log->details};
+}
 
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend) {

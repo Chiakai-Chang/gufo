@@ -55,6 +55,34 @@ def main():
                  ["llm", "--served-model-name", "--verbose", "--model", "audio"]):
         check(["serve", *args], 1, "Error loading model 'audio'")
     check(["serve", "help", "unknown"], 2, "unknown serve command")
+    help_text = check(["serve", "llm", "--help"], 0, "model native context")
+    assert "-1 = until EOS or context full" in help_text
+    assert "Path to GGUF model file (required)" in help_text
+    assert "8589934592" in help_text
+    assert "0 = auto, at most 1 GiB and 1/8 available RAM" in help_text
+    assert "--log-progress" in help_text
+    check(["bench", "--help"], 0, "Path to GGUF model file (required)")
+    for args in (["serve"], ["serve", "llm"], ["bench"],
+                 ["serve", "llm", "--model", ""], ["bench", "--model", ""]):
+        check(args, 2, "--model <PATH> is required")
+    check(["bench", "--model", "missing.gguf"], 1,
+          "Error loading GGUF model 'missing.gguf'")
+    for limit in ("-1", "1", "16384"):
+        check(["serve", "llm", "--model", "missing.gguf",
+               "--context", "0", "--max-tokens", limit],
+              1, "Error loading model")
+    for limit in ("0", "-2", "4294967296"):
+        check(["serve", "llm", "--max-tokens", limit], 2,
+              "sampling and scheduling limits are invalid")
+    for staging in (None, "0", "8589934592"):
+        args = ["serve", "llm", "--model", "missing.gguf",
+                "--cache-disk", "/unused-cache"]
+        if staging is not None:
+            args += ["--cache-disk-staging-bytes", staging]
+        check(args, 1, "Error loading model")
+    check(["serve", "llm", "--cache-disk", "/unused-cache",
+           "--cache-disk-bytes", "0"], 2,
+          "sampling and scheduling limits are invalid")
 
     for command in ("prompt", "chat", "bench"):
         check([command, "--help"], 0, "--draft-policy")

@@ -72,6 +72,8 @@ struct HttpResponse {
   struct StreamLog {
     std::string details;
     std::string error_code;
+    /// A terminal error was successfully written in the stream's protocol.
+    bool error_event_sent{false};
   };
   std::shared_ptr<StreamLog> stream_log{};
   std::function<void(WebSocket&)> websocket{};
@@ -108,8 +110,9 @@ public:
   /// Bind + listen. Returns false and sets *error on failure.
   bool start(std::string* error);
 
-  /// Blocking accept loop.
-  void run();
+  /// Blocking accept loop. The CLI handles SIGINT/SIGTERM; embedded callers
+  /// retain their own process signal handlers and call stop() explicitly.
+  void run(bool handle_signals = false);
 
   void stop();
 

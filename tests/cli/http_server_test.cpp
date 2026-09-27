@@ -2,11 +2,13 @@
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <csignal>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -31,6 +33,7 @@ public:
     std::size_t max_tokens = 0;
     gufo::sampling::SamplingConfig sampling;
     std::string client_id;
+    std::vector<std::string> stop_sequences;
   };
   Call LastCall() {
     const std::lock_guard lock(mutex_);
@@ -42,13 +45,18 @@ public:
   }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
+  gufo::ReasoningOptions reasoning_defaults() const override {
+    return reasoning;
+  }
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
   }
-  Result complete(std::string_view prompt, std::size_t limit,
-                  const gufo::sampling::SamplingConfig& sampling,
-                  const CancellationCheck& cancel, const TokenCallback& token,
-                  std::string_view client_id = "anonymous") override {
+  Result complete(
+      std::string_view prompt, std::size_t limit,
+      const gufo::sampling::SamplingConfig& sampling,
+      const CancellationCheck& cancel, const TokenCallback& token,
+      std::string_view client_id = "anonymous",
+      const std::vector<std::string>& stop_sequences = {}) override {
     ++calls;
     if (failure == 1)
       throw std::length_error("context exceeded");
@@ -71,7 +79,8 @@ public:
       last_ = {.prompt = std::string(prompt),
                .max_tokens = limit,
                .sampling = sampling,
-               .client_id = std::string(client_id)};
+               .client_id = std::string(client_id),
+               .stop_sequences = stop_sequences};
       result.text = output_;
     }
     result.prompt_tokens = 10;
@@ -85,6 +94,10 @@ public:
     result.decode_ms = 2;
     result.finish_reason =
         limit == 1 ? FinishReason::kLength : FinishReason::kStop;
+    if (!forced_stop_sequence.empty()) {
+      result.finish_reason = FinishReason::kStopSequence;
+      result.stop_sequence = forced_stop_sequence;
+    }
     if (token)
       (void)token(result.text);
     return result;
@@ -93,8 +106,8 @@ public:
               const gufo::sampling::SamplingConfig& sampling,
               const CancellationCheck& cancel,
               const TokenCallback& token) override {
-    auto result =
-        complete("", limit, sampling, cancel, token, request.client_id);
+    auto result = complete("", limit, sampling, cancel, token,
+                           request.client_id, request.stop_sequences);
     {
       const std::lock_guard lock(mutex_);
       last_.chat = request;
@@ -103,6 +116,8 @@ public:
   }
   std::atomic<int> calls{0};
   std::atomic<int> failure{0};
+  std::string forced_stop_sequence;
+  gufo::ReasoningOptions reasoning;
   bool wait_for_disconnect{false};
   std::atomic<bool> disconnected{false};
   std::binary_semaphore entered{0};
@@ -116,7 +131,8 @@ private:
 
 class RunningServer {
 public:
-  explicit RunningServer(gufo::server::HttpServerOptions options = {})
+  explicit RunningServer(gufo::server::HttpServerOptions options = {},
+                         bool handle_signals = false)
       : backend(std::make_shared<FakeBackend>()),
         server("127.0.0.1", 0, backend, nullptr, nullptr, nullptr,
                std::move(options)) {
@@ -134,19 +150,24 @@ public:
       auto log = std::make_shared<gufo::server::HttpResponse::StreamLog>();
       return gufo::server::HttpResponse{
           .streaming_body =
-              [log, fail = request.body == "fail"](const auto& write) {
+              [log, fail = !request.body.empty(),
+               reported = request.body == "reported"](const auto& write) {
                 (void)write(std::string_view("a\0b", 3));
                 (void)write("");
                 (void)write("end");
                 if (fail)
                   log->error_code = "injected";
+                log->error_event_sent = reported;
               },
           .stream_log = log,
       };
     });
     std::string error;
     assert(server.start(&error));
-    worker = std::jthread([this] { server.run(); });
+    worker = std::jthread([this, handle_signals] {
+      server.run(handle_signals);
+      run_finished.release();
+    });
   }
   ~RunningServer() {
     server.stop();
@@ -200,6 +221,7 @@ public:
 
   std::shared_ptr<FakeBackend> backend;
   HttpServer server;
+  std::binary_semaphore run_finished{0};
   std::jthread worker;
 };
 
@@ -342,6 +364,8 @@ void TestCompatibilityRequests() {
            Endpoint{"/completion", R"({"prompt":"hi"})", "n_predict"},
        }) {
     auto body = parse(endpoint.body);
+    response_body(server.Post(endpoint.path, body.dump()));
+    assert(server.backend->LastCall().max_tokens == 0);
     body["model"] = "test";
     body[endpoint.limit] = 1;
     body["temperature"] = 0.6;
@@ -384,8 +408,12 @@ void TestCompatibilityRequests() {
       invalid[endpoint.limit] = parse(value);
       ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
     }
-    for (const auto field : {"stream", "echo", "store", "background", "tools",
-                             "stop", "reasoning", "logit_bias"}) {
+    for (const auto field :
+         {"stream", "echo", "store", "background", "tools", "stop", "reasoning",
+          "output_config", "logit_bias"}) {
+      if (std::string_view(endpoint.path) == "/v1/responses" &&
+          std::string_view(field) == "stream")
+        continue;
       auto invalid = body;
       invalid[field] = true;
       ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
@@ -429,6 +457,50 @@ void TestCompatibilityRequests() {
   assert(messages.size() == 2);
   assert(messages[0].role == gufo::tokenization::ChatRole::kSystem &&
          messages[0].content == "Be concise." && messages[1].content == "hi");
+  for (const auto limit : {1, 2}) {
+    const auto streaming = server.Post(
+        "/v1/responses",
+        std::string(R"({"input":"hi","stream":true,"max_output_tokens":)") +
+            std::to_string(limit) + "}");
+    ExpectStatus(streaming, 200);
+    assert(streaming.find("text/event-stream") != std::string::npos);
+    assert(streaming.find("event: response.created") != std::string::npos);
+    assert(streaming.find("event: response.output_text.delta") !=
+           std::string::npos);
+    assert(streaming.find(limit == 1 ? "event: response.incomplete"
+                                     : "event: response.completed") !=
+           std::string::npos);
+  }
+  server.backend->failure = 1;
+  const auto failed_stream =
+      server.Post("/v1/responses", R"({"input":"hi","stream":true})");
+  ExpectStatus(failed_stream, 200);  // Fake backend fails after headers.
+  assert(failed_stream.find("event: response.failed") != std::string::npos);
+  assert(failed_stream.find("event: response.completed") == std::string::npos);
+  const auto failed_data = failed_stream.find(
+      "data: ", failed_stream.find("event: response.failed"));
+  assert(failed_data != std::string::npos);
+  const auto failed_event = gufo::json::parse(
+      std::string_view(failed_stream)
+          .substr(failed_data + 6,
+                  failed_stream.find("\n\n", failed_data) - failed_data - 6));
+  assert(failed_event.find("response")->find("error")->member_str("code") ==
+         "server_error");
+  assert(failed_stream.ends_with("0\r\n\r\n"));
+  server.backend->failure = 0;
+  const auto continued = response_body(
+      server.Post("/v1/responses",
+                  R"({"input":[{"role":"user","content":"First question"},
+        {"type":"reasoning","id":"rs_1","status":"completed",
+         "summary":[{"type":"summary_text","text":"Thoughts"}]},
+        {"type":"message","role":"assistant","content":[
+          {"type":"output_text","text":"Answer","annotations":[]}]},
+        {"role":"user","content":"Next question"}]})"));
+  assert(continued.member_str("status") == "completed");
+  const auto replay_messages = server.backend->LastCall().chat.messages;
+  assert(replay_messages.size() == 3 &&
+         replay_messages[1].thought == "Thoughts" &&
+         replay_messages[1].content == "Answer");
 
   const auto anthropic = response_body(
       server.Post("/v1/messages",
@@ -513,16 +585,102 @@ void TestPeerDisconnect() {
   assert(server.backend->disconnected);
 }
 
+void TestCompatibilityStopSequences() {
+  RunningServer server;
+  server.backend->forced_stop_sequence = "END";
+  for (
+      const auto& [path, body] : {
+          std::pair{"/v1/completions", R"({"prompt":"hello","stop":"END"})"},
+          std::pair{"/completion", R"({"prompt":"hello","stop":["END"]})"},
+          std::pair{
+              "/v1/messages",
+              R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":32,"stop_sequences":["END"]})"},
+      }) {
+    const auto response = server.Post(path, body);
+    ExpectStatus(response, 200);
+    assert(server.backend->LastCall().stop_sequences ==
+           std::vector<std::string>{"END"});
+    const auto output =
+        gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    if (std::string_view(path) == "/v1/messages") {
+      assert(output.member_str("stop_reason") == "stop_sequence");
+      assert(output.member_str("stop_sequence") == "END");
+    } else if (std::string_view(path) == "/completion") {
+      assert(output.find("stopped_word")->as_bool());
+      assert(!output.find("stopped_eos")->as_bool());
+      assert(output.member_str("stopping_word") == "END");
+    } else {
+      assert(output.find("choices")->items()[0].member_str("finish_reason") ==
+             "stop");
+    }
+  }
+  const auto before = server.backend->calls.load();
+  for (const auto* stop : {"null", "\"END\"", "[null]", "[\"\"]", "true"}) {
+    auto body = gufo::json::parse(
+        R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":32})");
+    body["stop_sequences"] = gufo::json::parse(stop);
+    ExpectStatus(server.Post("/v1/messages", body.dump()), 400);
+  }
+  ExpectStatus(server.Post("/v1/responses", R"({"input":"hi","stop":"END"})"),
+               400);
+  assert(server.backend->calls == before);
+  auto body = gufo::json::parse(
+      R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":32,"stop_sequences":[]})");
+  for (int i = 0; i < 65; ++i)
+    body["stop_sequences"].push_back(std::to_string(i));
+  ExpectStatus(server.Post("/v1/messages", body.dump()), 400);
+  body["stop_sequences"] = gufo::json::Value::array();
+  for (int i = 0; i < 5; ++i)
+    body["stop_sequences"].push_back(std::string(4096, 'x'));
+  ExpectStatus(server.Post("/v1/messages", body.dump()), 400);
+  server.backend->forced_stop_sequence.clear();
+  for (const int limit : {1, 32}) {
+    body["stop_sequences"] = gufo::json::Value::array();
+    body["max_tokens"] = limit;
+    const auto response = server.Post("/v1/messages", body.dump());
+    ExpectStatus(response, 200);
+    const auto output =
+        gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    assert(output.member_str("stop_reason") ==
+           (limit == 1 ? "max_tokens" : "end_turn"));
+    assert(output.find("stop_sequence")->is_null());
+  }
+}
+
+void TestCompatibilityThinkingDefaults() {
+  RunningServer server;
+  for (const bool enabled : {false, true}) {
+    server.backend->reasoning = {
+        .enabled = enabled,
+        .effort = gufo::ReasoningEffort::kHigh,
+        .preserve_thinking = true,
+    };
+    for (
+        const auto& [path, body] : {
+            std::pair{"/v1/responses", R"({"input":"hello"})"},
+            std::pair{
+                "/v1/messages",
+                R"({"messages":[{"role":"user","content":"hello"}],"max_tokens":32})"},
+        }) {
+      ExpectStatus(server.Post(path, body), 200);
+      const auto reasoning = server.backend->LastCall().chat.reasoning;
+      assert(reasoning.enabled == enabled);
+      assert(reasoning.effort == gufo::ReasoningEffort::kHigh);
+      assert(reasoning.preserve_thinking == true);
+    }
+  }
+}
+
 void TestStreamingFraming() {
   RunningServer server;
   const std::string chunks = std::string("3\r\na\0b\r\n", 8) + "3\r\nend\r\n";
-  for (const bool fail : {false, true}) {
-    const auto response = server.Post("/stream", fail ? "fail" : "");
+  for (const std::string body : {"", "fail", "reported"}) {
+    const auto response = server.Post("/stream", body);
     ExpectStatus(response, 200);
     assert(response.find("Transfer-Encoding: chunked\r\n") !=
            std::string::npos);
     assert(response.substr(response.find("\r\n\r\n") + 4) ==
-           chunks + (fail ? "" : "0\r\n\r\n"));
+           chunks + (body == "fail" ? "" : "0\r\n\r\n"));
   }
   const auto thrown = server.Post("/stream-error", "");
   assert(thrown.substr(thrown.find("\r\n\r\n") + 4) == "b\r\nfirst chunk\r\n");
@@ -531,6 +689,48 @@ void TestStreamingFraming() {
   assert(legacy.find("Transfer-Encoding:") == std::string::npos);
   assert(legacy.substr(legacy.find("\r\n\r\n") + 4) ==
          std::string("a\0bend", 6));
+}
+
+void TestSignalShutdown() {
+  // Process signals must never terminate the test runner itself. Prove that
+  // both idle listeners and active generation return through normal cleanup.
+  for (const int signal : {SIGINT, SIGTERM}) {
+    for (const bool active : {false, true}) {
+      const pid_t child = ::fork();
+      assert(child >= 0);
+      if (child == 0) {
+        ::alarm(5);
+        {
+          RunningServer server({}, true);
+          // Accepting a request proves run() installed its handlers.
+          ExpectStatus(server.Post("/echo", "ready"), 200);
+          int fd = -1;
+          if (active) {
+            server.backend->wait_for_disconnect = true;
+            fd = server.Connect();
+            const std::string body = R"({"prompt":"hello"})";
+            const std::string request =
+                "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body;
+            assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+                   static_cast<ssize_t>(request.size()));
+            assert(server.backend->entered.try_acquire_for(
+                std::chrono::seconds(2)));
+          }
+          assert(::kill(::getpid(), signal) == 0);
+          assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
+          if (active) {
+            assert(server.backend->disconnected);
+            ::close(fd);
+          }
+        }
+        ::_exit(0);
+      }
+      int status = 0;
+      assert(::waitpid(child, &status, 0) == child);
+      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
 }
 
 }  // namespace
@@ -542,8 +742,11 @@ int main() {
   TestAuthorization();
   TestFramingAndMetrics();
   TestCompatibilityRequests();
+  TestCompatibilityStopSequences();
+  TestCompatibilityThinkingDefaults();
   TestCompatibilityUtf8();
   TestPeerDisconnect();
   TestStreamingFraming();
+  TestSignalShutdown();
   std::cout << "HTTP transport checks passed.\n";
 }

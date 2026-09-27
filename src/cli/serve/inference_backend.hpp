@@ -50,10 +50,9 @@ struct TextSpeculativeConfig {
 
 struct TextDiskCacheConfig {
   std::filesystem::path directory;
-  std::size_t capacity_bytes{static_cast<std::size_t>(4) * 1024U * 1024U *
-                             1024U};
-  std::size_t staging_capacity_bytes{static_cast<std::size_t>(512) * 1024U *
-                                     1024U};
+  std::size_t capacity_bytes{TextRunnerDiskCacheOptions::kDefaultCapacityBytes};
+  /// Zero selects the automatic host RAM budget after session allocation.
+  std::size_t staging_capacity_bytes{0};
   std::string model_artifact_fingerprint;
   std::string draft_model_artifact_fingerprint;
 };
@@ -76,7 +75,7 @@ public:
 
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
   bool load(const std::string& model_path, std::string* error,
-            std::uint32_t max_context = 4096, std::size_t session_count = 1,
+            std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             const TextSpeculativeConfig& speculative_config = {},
@@ -86,7 +85,7 @@ public:
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
   bool load(std::shared_ptr<const hip::QwenGpuModel> model, std::string* error,
-            std::uint32_t max_context = 4096, std::size_t session_count = 1,
+            std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
@@ -94,7 +93,7 @@ public:
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
-            std::string* error, std::uint32_t max_context = 4096,
+            std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
@@ -105,7 +104,7 @@ public:
   /// request-owned sessions, the model's tokenizer, and host-memory
   /// continuation snapshots.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
-            std::string* error, std::uint32_t max_context = 4096,
+            std::string* error, std::uint32_t max_context = 0,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
@@ -117,6 +116,7 @@ public:
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
+  [[nodiscard]] std::uint32_t max_context() const;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
@@ -143,7 +143,8 @@ public:
                   const sampling::SamplingConfig& sampling,
                   const CancellationCheck& is_cancelled = {},
                   const TokenCallback& on_token = {},
-                  std::string_view client_id = "anonymous") override;
+                  std::string_view client_id = "anonymous",
+                  const std::vector<std::string>& stop_sequences = {}) override;
 
   /// Framed chat conversation; returns the assistant reply.
   Result chat(const ChatRequest& request, std::size_t max_tokens,

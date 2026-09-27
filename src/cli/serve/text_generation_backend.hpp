@@ -101,6 +101,7 @@ struct ChatRequest {
   std::string template_kwargs_json;
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};
+  std::vector<std::string> stop_sequences;
 };
 
 /// Model-agnostic text generation boundary used by the HTTP transport.
@@ -115,6 +116,7 @@ public:
 
   enum class FinishReason : std::uint8_t {
     kStop,
+    kStopSequence,
     kLength,
     kCancelled,
   };
@@ -126,7 +128,8 @@ public:
   };
 
   struct SamplingDefaults {
-    std::size_t max_tokens{128};
+    /// Zero means generate until EOS or the remaining context is exhausted.
+    std::size_t max_tokens{0};
     sampling::SamplingConfig sampling;
   };
 
@@ -144,6 +147,8 @@ public:
     std::size_t cache_shared_prefix_snapshots{0};
     std::size_t cache_shared_prefix_bytes{0};
     std::size_t completion_tokens{0};
+    /// Generated reasoning tokens, excluding the closing template delimiter.
+    std::size_t reasoning_tokens{0};
     std::size_t draft_tokens{0};
     std::size_t draft_accepted_tokens{0};
     std::size_t prefill_tokens{0};
@@ -175,6 +180,7 @@ public:
     std::size_t cache_common_prefix_tokens{0};
     std::size_t cache_checkpoint_tokens{0};
     FinishReason finish_reason{FinishReason::kStop};
+    std::string stop_sequence;
     bool incremental_prefill_supported{false};
     bool cache_hit{false};
     bool cache_disk_hit{false};
@@ -220,11 +226,13 @@ public:
     return InitialOutputState::kAuto;
   }
 
-  virtual Result complete(std::string_view prompt, std::size_t max_tokens,
-                          const sampling::SamplingConfig& sampling,
-                          const CancellationCheck& is_cancelled = {},
-                          const TokenCallback& on_token = {},
-                          std::string_view client_id = "anonymous") = 0;
+  virtual Result complete(
+      std::string_view prompt, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled = {},
+      const TokenCallback& on_token = {},
+      std::string_view client_id = "anonymous",
+      const std::vector<std::string>& stop_sequences = {}) = 0;
 
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
                       const sampling::SamplingConfig& sampling,
@@ -233,10 +241,12 @@ public:
 
   Result complete(std::string_view prompt, std::size_t max_tokens,
                   float temperature, const CancellationCheck& is_cancelled = {},
-                  const TokenCallback& on_token = {}) {
+                  const TokenCallback& on_token = {},
+                  const std::vector<std::string>& stop_sequences = {}) {
     sampling::SamplingConfig config;
     config.temperature = temperature;
-    return complete(prompt, max_tokens, config, is_cancelled, on_token);
+    return complete(prompt, max_tokens, config, is_cancelled, on_token,
+                    "anonymous", stop_sequences);
   }
 
   Result chat(const ChatRequest& request, std::size_t max_tokens,

@@ -1,6 +1,6 @@
 # OpenAI-Compatible Server
 
-Status: implemented subset, 2026-09-19
+Status: implemented subset, 2026-09-25
 
 ## Purpose
 
@@ -10,12 +10,15 @@ versioned contract: supported fields behave as documented, and unsupported
 fields return explicit errors.
 
 Chat Completions is the main API, including streaming, images and tools.
-Responses and Anthropic Messages currently expose synchronous text subsets.
+Responses supports text with optional streaming; Anthropic Messages exposes a
+synchronous text subset.
 The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
 - https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/
 - https://developers.openai.com/api/reference/resources/models/methods/list/
+- https://platform.claude.com/docs/en/api/handling-stop-reasons
+- https://developers.openai.com/api/docs/guides/streaming-responses
 
 The local server does not need to reproduce OpenAI-hosted storage, billing,
 organization, or account behavior.
@@ -26,7 +29,7 @@ The only supported production platform is Linux x86-64 on Strix Halo.
 
 The C++20 runtime uses bounded HTTP/1.1 requests, one connection worker per
 request, and a separate inference scheduler. Connections close after each
-response. Chat Completions supports Server-Sent Events; socket closure
+response. Chat Completions and Responses support Server-Sent Events; socket closure
 propagates cancellation to the scheduler. JSON parsing rejects duplicate keys,
 invalid numbers and nesting beyond 128 containers.
 
@@ -36,7 +39,7 @@ not be required to serve requests.
 ## Single Executable and Model Configuration
 
 The deployed product is one `gufo` executable. Supported model graphs,
-tokenizers, HIP kernels, and AIE programs are compiled into it.
+tokenizers and HIP kernels are compiled into it.
 
 The executable provides subcommands rather than separate inference binaries:
 
@@ -63,6 +66,28 @@ weights and tokenizer. Each request leases a preallocated `QwenGpuExecutor`
 with independent KV, recurrent, graph, activation, and logit state.
 `--sessions N` controls the bounded session pool. The scheduler batches ready
 requests when the model runner supports their execution mode.
+
+Text serving defaults match llama.cpp for context and generation length:
+
+| Setting | Default |
+| --- | --- |
+| `--context` | `0`: native context from model metadata, per session |
+| `--max-tokens` | `-1`: until EOS or remaining context is exhausted |
+| `--sessions` | `1` |
+| Thinking / reasoning effort | Model template defaults |
+
+Clients can set a positive `max_tokens` / `max_completion_tokens` (Chat
+Completions) or `max_output_tokens` (Responses). These include reasoning tokens.
+Omitting the field uses the server default. A response cannot exceed remaining
+context; exhaustion reports `length` or `incomplete`, without discarding earlier
+conversation tokens. Reduce `--context` or `--sessions` if their state exceeds
+available memory.
+
+Gufo retains greedy sampling by default. llama.cpp instead defaults to temperature
+0.8, top-k 40, top-p 0.95 and min-p 0.05; set these explicitly to match its sampler.
+Both leave repetition, frequency and presence penalties disabled.
+Reference: [llama.cpp parameters](https://github.com/ggml-org/llama.cpp/blob/68d9053afd4f4d0752ced6187585f862355a40be/common/common.h)
+and [server options](https://github.com/ggml-org/llama.cpp/blob/68d9053afd4f4d0752ced6187585f862355a40be/tools/server/README.md).
 
 ```sh
 nix build
@@ -130,6 +155,23 @@ Exact live continuations reuse generated tokens. The server reports cached
 and newly processed tokens separately; resuming from the checkpoint processes
 the short suffix. System instructions, tool definitions and image identities
 must match the retained prefix.
+
+`SIGINT` and `SIGTERM` cancel active requests and drain accepted disk writes
+before exiting. `--cache-disk DIR` defaults to 8 GiB retained on disk.
+`--cache-disk-staging-bytes 0` (the default) selects the smallest of 1 GiB,
+one eighth of available host RAM after model/session loading (including cgroup
+limits), and the disk budget. This bounds queued captures/writes and each disk
+read separately; it allocates nothing upfront. Live model state and retained
+RAM snapshots have separate budgets.
+
+Snapshots that exceed either limit are skipped with their required size and
+available budget logged; live conversation reuse remains available. Existing
+files that exceed the current staging limit are preserved subject to disk LRU
+eviction and can be reused after restarting with sufficient staging.
+For Flash-Next/MTP at full 262K context, explicitly set
+`--cache-disk-staging-bytes 8589934592` (8 GiB) if RAM permits.
+Qwen27B at full context needs larger staging and `--cache-disk-bytes` limits;
+use the required size reported in the skip log.
 
 For a focused cancellation check, run
 `python3 tools/serving/check-continuation.py --output /tmp/cache-check.json`
@@ -218,7 +260,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/v1/models` | List loaded model aliases and capabilities |
-| `POST` | `/v1/responses` | Synchronous text subset |
+| `POST` | `/v1/responses` | Text, optional SSE streaming |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness (aliases: `/v1/health`, `/healthz`) |
@@ -392,14 +434,36 @@ request limits, cancellation, cache accounting and completion state.
 ## Responses API Subset
 
 `POST /v1/responses` accepts `model`, `input` as text or text-message arrays,
-`instructions`, `max_output_tokens`, and the shared sampling controls. Clients
-supply the complete conversation. `store`, `background` and `stream` must be
-false when present. Images, tools, structured output, server-side conversations
-and `previous_response_id` are rejected on this route. Use Chat Completions for
-validated image, tool and streaming support.
+`instructions`, `max_output_tokens`, `stream`, and the shared sampling controls.
+Clients supply the complete conversation, including prior Gufo `output` items
+when retaining reasoning. `store` and `background` must be false
+when present. Images, tools, structured output, server-side conversations and
+`previous_response_id` are rejected on this route. Use Chat Completions for images
+and tools.
 
 Responses report `incomplete` with reason `max_output_tokens` when generation
-hits its limit. Otherwise they report `completed`.
+hits its limit. Otherwise they report `completed`. `stream: true` sends typed
+SSE events with consecutive `sequence_number` values: lifecycle, output items,
+text/reasoning deltas and terminal status. Local reasoning is exposed as
+`reasoning` items with `summary_text`; visible answers use `output_text`.
+Disconnects cancel generation through the same scheduler as Chat Completions.
+
+The official [OpenAI Python SDK](https://github.com/openai/openai-python) is
+included in `nix develop`. Use the model name from `/v1/models`
+(for example, `qwen` with `--served-model-name qwen`):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+for event in client.responses.create(
+    model="qwen", input="Hello", store=False, stream=True
+):
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="", flush=True)
+    elif event.type == "response.failed":
+        raise RuntimeError(event.response.error.message)
+```
 
 The other compatibility routes are deliberately limited:
 
@@ -410,8 +474,11 @@ The other compatibility routes are deliberately limited:
 | `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
 All four routes validate the loaded model, positive integer limits and shared
-sampling controls. They reject unsupported streaming, multiple candidates,
-stop strings and other generation controls instead of ignoring them.
+sampling controls. The three routes above reject streaming; all reject multiple
+candidates. Responses and Messages honor the server's thinking defaults.
+Native Messages rejects tools, `thinking`, and `output_config`; use Chat
+Completions for tool/reasoning controls. Completions routes accept `stop`;
+Messages accepts `stop_sequences`. Responses has no stop-sequence field.
 `/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
 and template-aware message counting are not implemented.
 
@@ -425,9 +492,15 @@ and template-aware message counting are not implemented.
 - `temperature`
 - `top_p`
 - `seed`
+- `stop`: null, one string, or an array of up to four strings
 - `stream`
 - `stream_options.include_usage`
-- `tools` and `tool_choice` when supported
+- `tools` and `tool_choice` when supported. Function tools accept the nested
+  Chat Completions shape and the flat Responses-style `{type,name,parameters}`
+  shape. Missing or null `parameters` become `{}`. `parametersJsonSchema` is
+  accepted as an alias for `parameters`. Flat definitions retain all function
+  fields, including `strict`. Unsupported tool types, malformed entries and
+  non-object parameters return 400 `invalid_tools` before generation.
 - shared top-k, min-p, repeat, frequency and presence sampling controls
 
 Streaming objects use `chat.completion.chunk` and end with the compatibility
@@ -444,7 +517,25 @@ sampling replay retains independent request histories.
 
 Tool calls are emitted only for declared functions when `tool_choice` allows
 calling tools. An unmet `required` choice returns `tool_choice_unsatisfied`
-(HTTP 502, or an SSE error after streaming starts).
+(HTTP 502, or an SSE error after streaming starts), unless a requested stop
+sequence interrupted generation first.
+
+Stop sequences match accepted output bytes, including reasoning and tool
+markup, before streaming or response parsing. Partial prefixes are buffered;
+matched sequences and subsequent text are excluded. OpenAI reports
+`finish_reason: "stop"`; Messages reports `stop_reason: "stop_sequence"` and
+the matched `stop_sequence`. EOS and length limits flush unmatched prefixes.
+Interrupted tool calls are omitted; complete preceding calls are retained.
+Usage includes the token completing the match. Each request has independent
+matching state, including speculative batches; caches retain only correctly
+labelled executed model state. Stops must be nonempty, at most 4 KiB each and
+16 KiB combined. Messages allows up to 64 sequences.
+
+Nullable Chat Completions defaults retain server settings, including sampling
+and token limits. `logprobs: false`, empty `logit_bias`,
+`response_format: {"type":"text"}` and `modalities: ["text"]` are accepted.
+Actual log probabilities, token biases, structured outputs and audio output
+remain unsupported and return explicit errors.
 
 Admission groups text requests by the socket peer's IP address across chat and
 compatibility endpoints. Caller-provided identity headers do not affect quotas;
@@ -551,6 +642,11 @@ Server lifecycle and request logs go to stderr. Each request gets an
 `X-Request-ID` response header matching its `request=rN` log entries. Inference
 requests log receipt and completion; streaming completion is logged after the
 stream ends. Successful health/metrics and video-status polls are quiet.
+
+Pass `--log-progress` to `gufo serve llm` to log each prefill chunk, each
+50-token decode boundary, and the final decode remainder. Each line includes the
+request ID, completed and total tokens, percentage, current speed and average
+speed. Speculative requests also include accepted and proposed drafts.
 
 Text completion logs include stop/length/cancellation, queue and first-token
 latency, prefill/decode speed, execution width, memory/disk cache hits and reused
