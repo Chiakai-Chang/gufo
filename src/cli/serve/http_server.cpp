@@ -1265,6 +1265,13 @@ void HttpServer::handle_connection(int client_fd) {
       ::inet_ntop(AF_INET, &peer.sin_addr, peer_address, sizeof(peer_address)))
     req.client_id = peer_address;
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
+  // Every logged request carries its peer address, so exposure is auditable.
+  const auto with_client = [&](std::string_view details) {
+    std::string out = "client=" + req.client_id;
+    if (!details.empty())
+      out.append(" ").append(details);
+    return out;
+  };
   bool response_started = false;
   bool http11 = false;
   int response_status = 0;
@@ -1379,7 +1386,8 @@ void HttpServer::handle_connection(int client_fd) {
       Logger::Info("http", "request=" + req.request_id +
                                " event=received method=" + req.method +
                                " path=" + req.path + " body_bytes=" +
-                               std::to_string(req.body.size()));
+                               std::to_string(req.body.size()) +
+                               " client=" + req.client_id);
     }
 
     HttpResponse resp;
@@ -1454,7 +1462,7 @@ void HttpServer::handle_connection(int client_fd) {
     }
     if (log_request || resp.status >= 400 || !connected) {
       Logger::LogRequest(req.request_id, req.method, req.path, resp.status,
-                         elapsed_ms(), resp.log_details, outcome);
+                         elapsed_ms(), with_client(resp.log_details), outcome);
     }
   } catch (const TextGenerationError& exception) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
@@ -1475,7 +1483,8 @@ void HttpServer::handle_connection(int client_fd) {
     Logger::LogRequest(req.request_id, req.method, req.path,
                        response_started ? response_status : resp.status,
                        duration_ms,
-                       std::string("error_code=") + exception.stable_code(),
+                       with_client(std::string("error_code=") +
+                                   exception.stable_code()),
                        response_started ? "stream_error" : "failed");
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
@@ -1488,7 +1497,7 @@ void HttpServer::handle_connection(int client_fd) {
     resp.headers.emplace_back("X-Request-ID", req.request_id);
     Logger::LogRequest(req.request_id, req.method, req.path,
                        response_started ? response_status : resp.status,
-                       duration_ms, "error_code=server_exception",
+                       duration_ms, with_client("error_code=server_exception"),
                        response_started ? "stream_error" : "failed");
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
@@ -1502,7 +1511,7 @@ void HttpServer::handle_connection(int client_fd) {
     resp.headers.emplace_back("X-Request-ID", req.request_id);
     Logger::LogRequest(req.request_id, req.method, req.path,
                        response_started ? response_status : resp.status,
-                       duration_ms, "error_code=server_exception",
+                       duration_ms, with_client("error_code=server_exception"),
                        response_started ? "stream_error" : "failed");
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
