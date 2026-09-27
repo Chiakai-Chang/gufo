@@ -645,9 +645,10 @@ void TestQwenToolBoundariesAndSchema() {
              1,
              R"({"flag":true,"limit":null,"tags":[false,"None","a \" True"],)"
              R"("text":"True"})"},
+        // Still invalid after literal conversion: passed through as a string.
         Case{"<tool_call><function=f><parameter=flag>Yes</parameter>"
              "</function></tool_call>",
-             0, ""},
+             1, R"({"flag":"Yes"})"},
         Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"text\":"
              "\"literal </tool_call>\"}}</tool_call>",
              1, R"({"text":"literal </tool_call>"})"},
@@ -1338,11 +1339,22 @@ void TestStopSequencesAndDefaultFields() {
   Expect(gufo::server::HandleOpenAiChat(Request(body.dump()), backend).status ==
              200,
          "explicit text-only and disabled logprobs defaults work");
+  // Accepted and logged as ignored, as llama-server does: agent clients send
+  // these (Hermes uses response_format for titles).
   for (const auto* request :
        {R"({"logprobs":true})", R"({"top_logprobs":3})",
         R"({"response_format":{"type":"json_object"}})",
-        R"({"modalities":["text","audio"]})", R"({"audio":{}})",
         R"({"response_format":{"type":"text","unexpected":true}})"}) {
+    auto lenient = base;
+    const auto fields = gufo::json::parse(request);
+    for (const auto& [key, value] : fields.members())
+      lenient[key] = value;
+    Expect(gufo::server::HandleOpenAiChat(Request(lenient.dump()), backend)
+                   .status == 200,
+           "llama-server-compatible fields are accepted as ignored");
+  }
+  for (const auto* request :
+       {R"({"modalities":["text","audio"]})", R"({"audio":{}})"}) {
     auto invalid = base;
     const auto fields = gufo::json::parse(request);
     for (const auto& [key, value] : fields.members())

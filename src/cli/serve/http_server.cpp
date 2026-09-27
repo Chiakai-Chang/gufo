@@ -1153,7 +1153,10 @@ void HttpServer::run(bool handle_signals) {
         stop();
         break;
       }
-      pollfd descriptor{.fd = listen_fd_, .events = POLLIN, .revents = 0};
+      // Winsock's pollfd::fd is a SOCKET, not an int.
+      pollfd descriptor{.fd = static_cast<decltype(pollfd::fd)>(listen_fd_),
+                        .events = POLLIN,
+                        .revents = 0};
       const int ready = ::poll(&descriptor, 1, 100);
       if (ready < 0 && errno != EINTR)
         throw std::system_error(errno, std::generic_category(),

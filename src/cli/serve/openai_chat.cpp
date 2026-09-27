@@ -699,7 +699,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
       output->ignored_fields += ',';
     output->ignored_fields += field;
   };
-  if (body.contains("audio")) {
+  if (const json::Value* audio = body.find("audio");
+      audio != nullptr && !audio->is_null()) {
     return Error(400, "Bad Request", "request field 'audio' is not implemented",
                  "unsupported_field");
   }
