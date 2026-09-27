@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #ifndef _WIN32
 #include <csignal>
+#include <fcntl.h>
 #include <sys/time.h>
 #include <unistd.h>
 #endif
@@ -28,10 +29,29 @@ inline int OpenTcpSocket() {
 #endif
 }
 
+inline bool SetSocketNonBlocking(int fd, bool enabled) {
+#ifdef _WIN32
+  u_long mode = enabled ? 1 : 0;
+  return ::ioctlsocket(static_cast<SOCKET>(fd), FIONBIO, &mode) == 0;
+#else
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  if (flags < 0)
+    return false;
+  return ::fcntl(fd, F_SETFL,
+                 enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) == 0;
+#endif
+}
+
 inline int AcceptSocket(int listen_fd) {
 #ifdef _WIN32
   const SOCKET s = ::accept(static_cast<SOCKET>(listen_fd), nullptr, nullptr);
-  return s == INVALID_SOCKET ? -1 : static_cast<int>(s);
+  if (s == INVALID_SOCKET)
+    return -1;
+  // Unlike POSIX, a Winsock socket inherits the listener's non-blocking mode;
+  // connection handlers expect blocking reads with timeouts.
+  u_long blocking = 0;
+  ::ioctlsocket(s, FIONBIO, &blocking);
+  return static_cast<int>(s);
 #else
   return ::accept(listen_fd, nullptr, nullptr);
 #endif

@@ -1133,8 +1133,7 @@ void HttpServer::run(bool handle_signals) {
     signals.emplace();
     // A connection may disappear between poll and accept. Never let that
     // race put the signal-aware loop back into an uninterruptible accept.
-    const int flags = ::fcntl(listen_fd_, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK) != 0)
+    if (!platform::SetSocketNonBlocking(listen_fd_, true))
       throw std::system_error(errno, std::generic_category(),
                               "configure HTTP listener");
   }
