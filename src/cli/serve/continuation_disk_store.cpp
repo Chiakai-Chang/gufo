@@ -244,11 +244,17 @@ std::string ErrnoMessage(std::string_view operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
+// The Windows CRT read() fails with EINVAL for counts above INT_MAX, so large
+// snapshot files (over 2 GiB) could be written but never read back.
+std::size_t IoChunk(std::size_t remaining) noexcept {
+  return remaining < (std::size_t{1} << 30) ? remaining : (std::size_t{1} << 30);
+}
+
 bool WriteAll(int descriptor, std::span<const std::uint8_t> bytes) noexcept {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
     const ssize_t written =
-        ::write(descriptor, bytes.data() + offset, bytes.size() - offset);
+        ::write(descriptor, bytes.data() + offset, IoChunk(bytes.size() - offset));
     if (written < 0) {
       if (errno == EINTR) {
         continue;
@@ -267,7 +273,7 @@ bool ReadAll(int descriptor, std::span<std::uint8_t> bytes) noexcept {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
     const ssize_t count =
-        ::read(descriptor, bytes.data() + offset, bytes.size() - offset);
+        ::read(descriptor, bytes.data() + offset, IoChunk(bytes.size() - offset));
     if (count < 0) {
       if (errno == EINTR) {
         continue;
