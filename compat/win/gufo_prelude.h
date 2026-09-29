@@ -41,4 +41,15 @@ typedef int uid_t;
 typedef int gid_t;
 typedef unsigned int mode_t;
 
+// POSIX environment setters (MSVC CRT has only _putenv_s).
+#include <stdlib.h>
+static inline int setenv(const char* name, const char* value, int overwrite) {
+  if (!overwrite && getenv(name) != NULL)
+    return 0;
+  return _putenv_s(name, value) == 0 ? 0 : -1;
+}
+static inline int unsetenv(const char* name) {
+  return _putenv_s(name, "") == 0 ? 0 : -1;
+}
+
 #endif  // _WIN32
