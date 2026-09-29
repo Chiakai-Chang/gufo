@@ -6,3 +6,5 @@ MIT licensed (llama.cpp: see LICENSE.llama.cpp; nlohmann/json: MIT, header notic
 
 Local change: `json.cpp` uses `assert` instead of `GGML_ASSERT` so it builds without ggml.
 Used by `src/models/qwen/jinja_chat.cpp` for `--chat-template-file`.
+
+Later picks from ggml-org/llama.cpp: `4e416ee73` (unary +/- before variables) and `33c923db1` (`dict` builtin).
