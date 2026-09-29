@@ -45,6 +45,20 @@ public:
   }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
+  std::uint32_t max_context() const override { return 65536; }
+  std::shared_ptr<GenerationRequest> start_complete(
+      std::string_view prompt, std::size_t max_tokens,
+      const gufo::sampling::SamplingConfig& sampling,
+      const CancellationCheck& cancellation, bool stream, bool ignore_eos,
+      std::string_view client_id,
+      const std::vector<std::string>& stop_sequences) override {
+    last_ignore_eos = ignore_eos;
+    return TextGenerationBackend::start_complete(prompt, max_tokens, sampling,
+                                                 cancellation, stream, false,
+                                                 client_id, stop_sequences);
+  }
+  SamplingDefaults sampling_defaults() const override { return defaults; }
+  SamplingDefaults defaults;
   gufo::ReasoningOptions reasoning_defaults() const override {
     return reasoning;
   }
@@ -115,6 +129,7 @@ public:
     return result;
   }
   std::atomic<int> calls{0};
+  std::atomic<bool> last_ignore_eos{false};
   std::atomic<int> failure{0};
   std::string forced_stop_sequence;
   gufo::ReasoningOptions reasoning;
@@ -366,6 +381,23 @@ void TestCompatibilityRequests() {
     auto body = parse(endpoint.body);
     response_body(server.Post(endpoint.path, body.dump()));
     assert(server.backend->LastCall().max_tokens == 0);
+    server.backend->defaults.model = gufo::sampling::TextModelPreset::kQwen38;
+    server.backend->defaults.supplied = {};
+    server.backend->reasoning.enabled = false;
+    response_body(server.Post(endpoint.path, body.dump()));
+    const auto preset = server.backend->LastCall().sampling;
+    assert(preset.temperature == 0.7F && preset.top_p == 0.8F &&
+           preset.top_k == 20 && preset.presence_penalty == 1.5F);
+    server.backend->defaults.sampling.top_k = 0;
+    server.backend->defaults.supplied.top_k = true;
+    body["temperature"] = 0;
+    body["presence_penalty"] = 0;
+    response_body(server.Post(endpoint.path, body.dump()));
+    const auto overridden = server.backend->LastCall().sampling;
+    assert(overridden.temperature == 0 && overridden.top_k == 0 &&
+           overridden.top_p == 0.8F && overridden.presence_penalty == 0);
+    server.backend->defaults = {};
+    server.backend->reasoning = {};
     body["model"] = "test";
     body[endpoint.limit] = 1;
     body["temperature"] = 0.6;
@@ -410,9 +442,13 @@ void TestCompatibilityRequests() {
     }
     for (const auto field :
          {"stream", "echo", "store", "background", "tools", "stop", "reasoning",
-          "output_config", "logit_bias"}) {
-      if (std::string_view(endpoint.path) == "/v1/responses" &&
-          std::string_view(field) == "stream")
+          "output_config", "logit_bias", "ignore_eos"}) {
+      const std::string_view path(endpoint.path);
+      const std::string_view name(field);
+      if ((path == "/v1/responses" || path == "/v1/completions") &&
+          name == "stream")
+        continue;
+      if (path == "/v1/completions" && name == "ignore_eos")
         continue;
       auto invalid = body;
       invalid[field] = true;
@@ -432,7 +468,7 @@ void TestCompatibilityRequests() {
   ExpectStatus(server.Post("/v1/completions", R"({"prompt":["one","two"]})"),
                400);
   ExpectStatus(server.Post("/v1/responses",
-                           R"({"input":[{"role":"user","content":[
+                           R"({"input":[{"role":"assistant","content":[
                            {"type":"input_text","text":"describe"},
                            {"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]})"),
                400);
@@ -447,6 +483,20 @@ void TestCompatibilityRequests() {
                            R"({"messages":[{"role":"user","content":"hi"}]})"),
                501);
   assert(server.backend->calls == calls);
+
+  const auto structured =
+      response_body(server.Post("/v1/responses",
+                                R"({"input":[{"role":"user","content":[
+        {"type":"input_text","text":"describe"},
+        {"type":"input_image","image_url":"data:image/png;base64,AA=="}]}],
+        "reasoning":{"effort":"none"},
+        "text":{"format":{"type":"json_schema","name":"answer","strict":true,
+          "schema":{"type":"object","properties":{"score":{"type":"integer","minimum":1,"maximum":5}},
+          "required":["score"],"additionalProperties":false}}}})"));
+  const auto request = server.backend->LastCall().chat;
+  assert(request.response_format && request.reasoning.enabled == false &&
+         request.messages.back().images.size() == 1 &&
+         request.messages.back().images[0].offset == 8);
 
   const auto response = response_body(server.Post(
       "/v1/responses",
@@ -509,6 +559,83 @@ void TestCompatibilityRequests() {
           "max_tokens":2})"));
   assert(anthropic.member_str("stop_reason") == "end_turn");
   assert(server.backend->LastCall().chat.messages[0].content == "Be concise.");
+}
+
+void TestRawCompletionStreaming() {
+  RunningServer server;
+  using gufo::json::parse;
+  const auto models = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
+  ExpectStatus(models, 200);
+  const auto listing = parse(models.substr(models.find("\r\n\r\n") + 4));
+  assert(listing.find("data")->items()[0].member_size("context_length") ==
+         65536);
+
+  const auto response = server.Post(
+      "/v1/completions",
+      R"({"prompt":"hello","max_tokens":256,"stream":true,"stream_options":{"include_usage":true},"ignore_eos":true})");
+  ExpectStatus(response, 200);
+  assert(response.find("text/event-stream") != std::string::npos);
+  std::vector<gufo::json::Value> events;
+  std::size_t offset = 0;
+  while ((offset = response.find("data: ", offset)) != std::string::npos) {
+    const auto begin = offset + 6;
+    const auto end = response.find("\n\n", begin);
+    assert(end != std::string::npos);
+    const auto data = std::string_view(response).substr(begin, end - begin);
+    if (data != "[DONE]")
+      events.push_back(parse(data));
+    offset = end + 2;
+  }
+  assert(events.size() == 3);
+  const auto& content = events[0];
+  assert(content.member_str("object") == "text_completion");
+  assert(content.find("choices")->items().size() == 1);
+  assert(content.find("choices")->items()[0].member_str("text") == "ok");
+  assert(content.find("choices")->items()[0].find("finish_reason")->is_null());
+  assert(content.find("usage") == nullptr);
+  const auto& terminal = events[1];
+  assert(terminal.find("choices")->items().size() == 1);
+  assert(terminal.find("choices")->items()[0].member_str("text").empty());
+  assert(terminal.find("choices")->items()[0].member_str("finish_reason") ==
+         "stop");
+  assert(terminal.find("usage") == nullptr);
+  const auto& usage = events[2];
+  assert(usage.find("choices")->items().empty());
+  assert(usage.find("usage")->member_size("completion_tokens") == 1);
+  assert(usage.find("usage")->member_size("cached_tokens") == 8);
+  assert(response.find("data: [DONE]\n\n") != std::string::npos);
+  assert(server.backend->last_ignore_eos);
+  assert(server.backend->LastCall().max_tokens == 256);
+
+  server.backend->failure = 1;
+  const auto failed = server.Post(
+      "/v1/completions",
+      R"({"prompt":"hello","stream":true,"stream_options":{"include_usage":true}})");
+  ExpectStatus(failed, 200);
+  assert(failed.find("\"code\":\"generation_failed\"") != std::string::npos);
+  assert(failed.find("\"message\":\"generation failed\"") != std::string::npos);
+  assert(failed.find("context exceeded") == std::string::npos);
+  assert(failed.find("data: [DONE]\n\n") != std::string::npos);
+  server.backend->failure = 0;
+
+  for (
+      const auto* body : {
+          R"({"prompt":"hello","stream_options":{"include_usage":true}})",
+          R"({"prompt":"hello","stream":true,"stream_options":{"include_usage":"true"}})",
+          R"({"prompt":"hello","stream":true,"stream_options":{"other":true}})",
+          R"({"prompt":"hello","ignore_eos":1})",
+          R"({"prompt":"hello","stream":true,"text":{"format":{"type":"json_object"}}})",
+          R"({"prompt":"hello","stream":true,"reasoning":{"effort":"none"}})",
+      })
+    ExpectStatus(server.Post("/v1/completions", body), 400);
+
+  // Raw Completions owns the fixed-length contract; every other text endpoint
+  // rejects the field instead of silently generating a shorter run.
+  ExpectStatus(
+      server.Post(
+          "/v1/chat/completions",
+          R"({"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"ignore_eos":true})"),
+      400);
 }
 
 void TestInvalidBindSettings() {
@@ -671,6 +798,75 @@ void TestCompatibilityThinkingDefaults() {
   }
 }
 
+void TestResponseSamplingDefaults() {
+  RunningServer server;
+  using gufo::sampling::TextModelPreset;
+  for (const auto model :
+       {TextModelPreset::kQwen38, TextModelPreset::kDeepSeekV4Flash}) {
+    server.backend->defaults.model = model;
+    for (const bool server_thinking : {false, true}) {
+      server.backend->reasoning.enabled = server_thinking;
+      for (const char* effort :
+           {"null", "\"none\"", "\"minimal\"", "\"low\"", "\"medium\"",
+            "\"high\"", "\"xhigh\"", "\"max\""}) {
+        auto body = gufo::json::parse(
+            R"({"input":"hello","max_output_tokens":1,"temperature":null,"top_p":null,"presence_penalty":null,"reasoning":{},"text":{"format":{"type":"json_object"}}})");
+        body["reasoning"]["effort"] = gufo::json::parse(effort);
+        const bool thinking = std::string_view(effort) == "null"
+                                  ? server_thinking
+                                  : std::string_view(effort) != "\"none\"";
+        const bool qwen_off = model == TextModelPreset::kQwen38 && !thinking;
+        server.backend->defaults.supplied = {};
+        ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+        auto call = server.backend->LastCall();
+        assert(call.chat.reasoning.enabled == thinking);
+        assert(call.chat.response_format);
+        assert(call.sampling.temperature == (qwen_off ? 0.7F : 1.0F));
+        assert(call.sampling.top_p == (qwen_off ? 0.8F : 0.95F));
+        assert(call.sampling.presence_penalty == (qwen_off ? 1.5F : 0.0F));
+        assert(call.sampling.top_k ==
+               (model == TextModelPreset::kQwen38 ? 20 : 0));
+        // Explicit CLI values survive reasoning changes and SDK nulls.
+        server.backend->defaults.sampling.temperature = 0.25F;
+        server.backend->defaults.sampling.top_k = 0;
+        server.backend->defaults.supplied = {.temperature = true,
+                                             .top_k = true};
+        ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+        call = server.backend->LastCall();
+        assert(call.sampling.temperature == 0.25F && call.sampling.top_k == 0);
+        assert(call.sampling.top_p == (qwen_off ? 0.8F : 0.95F));
+        // Per-request zero overrides both CLI and model values, also streamed.
+        body["temperature"] = 0;
+        body["presence_penalty"] = 0;
+        body["top_k"] = 3;
+        body["stream"] = true;
+        ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+        call = server.backend->LastCall();
+        assert(call.sampling.temperature == 0 && call.sampling.top_k == 3);
+        assert(call.sampling.presence_penalty == 0);
+      }
+    }
+  }
+  // Responses must preserve the same request-owned cache control as Chat.
+  auto body = gufo::json::parse(R"({"input":"hello","max_output_tokens":1})");
+  ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+  assert(server.backend->LastCall().chat.cache_prompt);
+  for (const bool stream : {false, true}) {
+    body["stream"] = stream;
+    for (const bool cache : {false, true}) {
+      body["cache_prompt"] = cache;
+      ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
+      assert(server.backend->LastCall().chat.cache_prompt == cache);
+    }
+  }
+  for (const char* invalid : {"null", "0", "\"false\""}) {
+    body["cache_prompt"] = gufo::json::parse(invalid);
+    const int calls = server.backend->calls;
+    ExpectStatus(server.Post("/v1/responses", body.dump()), 400);
+    assert(server.backend->calls == calls);
+  }
+}
+
 void TestStreamingFraming() {
   RunningServer server;
   const std::string chunks = std::string("3\r\na\0b\r\n", 8) + "3\r\nend\r\n";
@@ -742,8 +938,10 @@ int main() {
   TestAuthorization();
   TestFramingAndMetrics();
   TestCompatibilityRequests();
+  TestRawCompletionStreaming();
   TestCompatibilityStopSequences();
   TestCompatibilityThinkingDefaults();
+  TestResponseSamplingDefaults();
   TestCompatibilityUtf8();
   TestPeerDisconnect();
   TestStreamingFraming();

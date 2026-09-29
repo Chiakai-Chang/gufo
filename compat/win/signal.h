@@ -2,6 +2,10 @@
 #include_next <signal.h>
 #include "gufo_posix.h"
 typedef int sigset_t;
+#ifndef SIGBUS
+#define SIGBUS 10  // no bus-error signal on Windows; sigaction() ignores it
+#endif
+#define SA_RESETHAND 0x80000000
 struct sigaction {
   void (*sa_handler)(int);
   sigset_t sa_mask;

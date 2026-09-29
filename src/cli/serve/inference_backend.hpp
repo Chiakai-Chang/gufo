@@ -116,7 +116,7 @@ public:
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
-  [[nodiscard]] std::uint32_t max_context() const;
+  [[nodiscard]] std::uint32_t max_context() const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
@@ -135,7 +135,9 @@ public:
   }
   [[nodiscard]] bool has_vision() const override { return has_vision_; }
   void set_sampling_defaults(std::size_t max_tokens,
-                             const sampling::SamplingConfig& sampling);
+                             const sampling::SamplingConfig& sampling,
+                             sampling::SamplingOverrides supplied =
+                                 sampling::SamplingOverrides::All());
   void set_reasoning_defaults(const ReasoningOptions& reasoning);
 
   /// Plain text completion (no chat framing).
@@ -157,6 +159,13 @@ public:
       const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {},
       bool stream_output = false) override;
+
+  std::shared_ptr<GenerationRequest> start_complete(
+      std::string_view prompt, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled = {}, bool stream_output = false,
+      bool ignore_eos = false, std::string_view client_id = "anonymous",
+      const std::vector<std::string>& stop_sequences = {}) override;
 
   Result chat(const std::vector<tokenization::ChatMessage>& messages,
               std::size_t max_tokens, const sampling::SamplingConfig& sampling,

@@ -345,16 +345,9 @@ struct Encoder::Impl {
     expect("clip.vision.attention.head_count", kHeads);
     expect("clip.vision.spatial_merge_size", 2);
     expect("clip.vision.image_size", 768);
-    const std::string_view model =
-        width == 5120 ? "Qwen3.8-27B" : "Qwen3.8-Flash-Next";
     if ((width != 5120 && width != 2560) ||
         reader->GetMetadataString("general.architecture") != "clip" ||
         reader->GetMetadataString("general.type") != "mmproj" ||
-        // Finetunes keep the tower but rename or drop the basename; the
-        // structural keys above and below still pin the architecture.
-        (reader->GetMetadataString("general.basename").has_value() &&
-         reader->GetMetadataString("general.basename")->find(model) ==
-             std::string_view::npos) ||
         reader->GetMetadataBool("clip.has_vision_encoder") != true ||
         reader->GetMetadataBool("clip.use_gelu") != true ||
         reader->GetMetadataFloat32(
