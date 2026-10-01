@@ -906,7 +906,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
-  const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
+  const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification = gpu_greedy;
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
                                    sampled ? &pending->candidates : nullptr)) {
@@ -926,7 +926,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->sampled = sampled;
   pending->gpu_greedy = gpu_greedy;
   pending->gpu_verification = gpu_verification;
-  if (!gpu_verification && verify_logits_.empty()) {
+  if (!gpu_verification &&
+      verify_logits_.size() < exec.max_speculative() * model_->VocabSize()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
   }
   // ModelOptions::prompt_lookup (single session): after each kept MTP
@@ -997,7 +998,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
   std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
   if (gpu_greedy &&
-      !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), error_msg)) {
+      !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), sampler,
+                                 std::span(chain).subspan(1), error_msg)) {
     return false;
   }
   // Tuning::fast_sampling: sampled verification reads GPU-selected
@@ -1024,12 +1026,27 @@ bool Session::FinishDecode(const DecodeRequest& request,
   }
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
+  bool cpu_rows = false;
   while (keep < k) {
-    if (gpu_greedy) {
+    if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
       if (!std::isfinite(prediction.value)) {
         AssignError(error_msg, "logit distribution contains no finite values");
         return false;
+      }
+      if (!sampler.CanSelectArgmax(prediction.index,
+                                   /*penalties_applied=*/true)) {
+        // Most native tool tokens already obey the grammar. On the first
+        // forbidden argmax, download the remaining rows once and use exact
+        // masked selection. Avoid one synchronization per rejected candidate.
+        // SelectBatchLogits has already installed this session's row offset.
+        verify_logits_.resize(exec.max_speculative() * vocab);
+        auto rows = std::span(verify_logits_)
+                        .subspan((keep - 1) * vocab, (k - keep + 1) * vocab);
+        if (!exec.ReadVerificationRows(keep - 1, rows, error_msg))
+          return false;
+        cpu_rows = true;
+        continue;
       }
       if (is_stop(prediction.index)) {
         result->stop = true;
@@ -1079,17 +1096,18 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     ++keep;
   }
+  // The frontier row is on the GPU unless verification rows were read back.
+  const bool frontier_on_device =
+      gpu_verification ? !cpu_rows : pending.rows_on_device;
   if (!exec.Rollback(*session_, keep, error_msg,
-                     gpu_verification || pending.rows_on_device ? logits_.data()
-                                                                : nullptr)) {
+                     frontier_on_device ? logits_.data() : nullptr)) {
     return false;
   }
+  if (!frontier_on_device) {
+    std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
+                logits_.begin());
+  }
   if (!gpu_verification) {
-    // Rows kept on the GPU: Rollback already wrote the frontier to logits_.
-    if (!pending.rows_on_device) {
-      std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
-                  logits_.begin());
-    }
     // The next PrepareDecode samples its anchor from this row's list.
     anchor_candidates_valid_ = have_candidates;
     if (have_candidates) {

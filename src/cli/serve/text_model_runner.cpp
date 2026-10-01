@@ -232,9 +232,13 @@ std::string_view SnapshotEventReasonName(SnapshotEventReason reason) noexcept {
 }
 
 void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
-  // Replacing or evicting a retained prefix is routine; request summaries
-  // already report whether reuse succeeded. Failed captures need attention.
-  if (event.action == SnapshotEventAction::kRemoved)
+  // Replacing a retained prefix, or dropping one to fit the byte budget, is
+  // routine; request summaries already report whether reuse succeeded.
+  // Losing one because every entry is taken is not routine: the server holds
+  // fewer conversations than the workload rotates through, so it is doing
+  // avoidable full re-prefills. Failed captures also need attention.
+  if (event.action == SnapshotEventAction::kRemoved &&
+      event.reason != SnapshotEventReason::kEntryCapacity)
     return;
   try {
     std::ostringstream line;
@@ -308,7 +312,6 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
   switch (event.reason) {
     case ContinuationDiskEventReason::kHit:
     case ContinuationDiskEventReason::kNotFound:
-    case ContinuationDiskEventReason::kLru:
     case ContinuationDiskEventReason::kExactReplacement:
     case ContinuationDiskEventReason::kBusy:
       return;
@@ -332,6 +335,11 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
          << " staging_used_bytes=" << event.staging_used_bytes;
     if (event.reason == ContinuationDiskEventReason::kSaved) {
       line << " write_ms=" << event.elapsed_ms;
+      Logger::Info("cache", line.str());
+    } else if (event.reason == ContinuationDiskEventReason::kLru) {
+      // Staying inside a configured budget is expected operation, but it has
+      // to be visible: otherwise a run that evicts every other conversation
+      // looks identical to one that never cached anything.
       Logger::Info("cache", line.str());
     } else {
       Logger::Warn("cache", line.str());
@@ -474,6 +482,15 @@ struct TextRunnerPool::Impl {
             state_count <= std::numeric_limits<std::size_t>::max() / 2
                 ? state_count * 2
                 : state_count) {
+    // Entry and byte limits constrain retention independently of session count.
+    if (validated.descriptor.capabilities.snapshot) {
+      Logger::Info("cache",
+                   "event=snapshot_cache_configured sessions=" +
+                       std::to_string(state_count) + " snapshot_entries=" +
+                       std::to_string(cache.entry_capacity()) +
+                       " capacity_bytes=" +
+                       std::to_string(cache.snapshot_capacity_bytes()));
+    }
     if (disk_cache_options.has_value()) {
       if (!validated.descriptor.persistence.has_value()) {
         throw std::invalid_argument(

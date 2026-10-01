@@ -120,6 +120,7 @@ public:
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
+  [[nodiscard]] bool supports_images() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   [[nodiscard]] std::uint32_t max_context() const override;
   [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
@@ -170,7 +171,8 @@ public:
       const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {}, bool stream_output = false,
       bool ignore_eos = false, std::string_view client_id = "anonymous",
-      const std::vector<std::string>& stop_sequences = {}) override;
+      const std::vector<std::string>& stop_sequences = {},
+      bool return_progress = false) override;
 
   Result chat(const std::vector<tokenization::ChatMessage>& messages,
               std::size_t max_tokens, const sampling::SamplingConfig& sampling,

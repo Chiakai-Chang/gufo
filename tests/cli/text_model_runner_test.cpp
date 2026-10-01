@@ -1307,9 +1307,68 @@ void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
   extension.Invalidate();
 }
 
+/// Evicting a retained prefix because the entry table is full is not routine:
+/// it means the server is configured below its workload and is doing avoidable
+/// full re-prefills. It must be visible, unlike exact replacement.
+void TestEntryCapacityEvictionIsLogged() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SnapshotRunner>(stats);
+  // One session, so the cache holds two entries and a third distinct prefix
+  // must displace one of them.
+  TextRunnerPool pool(runner, 1);
+
+  const std::array<std::vector<TextRunnerToken>, 3> prefixes{
+      std::vector<TextRunnerToken>{1, 2, 3},
+      std::vector<TextRunnerToken>{4, 5, 6},
+      std::vector<TextRunnerToken>{7, 8, 9}};
+  for (const auto& prefix : prefixes) {
+    auto request = pool.Acquire(prefix);
+    Expect(request.Prefill(prefix.size()).decode_ready,
+           "each distinct prefix reaches its snapshot boundary");
+    (void)request.SelectNext();
+    request.Advance();
+    Expect(request.Commit().snapshot_bytes == sizeof(FakeSnapshot),
+           "each distinct prefix retains a snapshot");
+  }
+
+  // The first prefix was evicted, so it can no longer be reused.
+  auto evicted = pool.Acquire(prefixes.front());
+  Expect(!evicted.cache_hit(),
+         "the oldest retained prefix is gone once the entries are full");
+  evicted.Invalidate();
+}
+
+void TestSnapshotCacheCapacityIsReportedAtStartup() {
+  for (const std::size_t budget : {0U, 256U}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256, budget);
+    std::ostringstream startup_log;
+    auto* previous = std::clog.rdbuf(startup_log.rdbuf());
+    {
+      TextRunnerPool pool(runner, 2);
+    }
+    std::clog.rdbuf(previous);
+    const auto output = startup_log.str();
+    const std::string expected =
+        "event=snapshot_cache_configured sessions=2 snapshot_entries=4 "
+        "capacity_bytes=" +
+        std::to_string(budget) + "\n";
+    const auto position = output.find(expected);
+    Expect(position != std::string::npos &&
+               output.find(expected, position + expected.size()) ==
+                   std::string::npos,
+           "startup reports actual session, entry and byte limits once");
+    Expect(output.find("retained_conversations") == std::string::npos,
+           "startup does not present session count as conversation capacity");
+  }
+}
+
 }  // namespace
 
 int main() {
+  // The cache warning assertion in this binary matches the plain "[WARN]
+  // [cache]" text captured from a redirected sink; a TTY stderr tints it.
+  ::setenv("NO_COLOR", "1", 1);
   TestNewImageGetsAStableCheckpoint();
   TestGeneratedFrontierForksBeforeMutation();
   TestGeneratedFrontierPersistsForForks();
@@ -1332,7 +1391,20 @@ int main() {
   auto* previous = std::clog.rdbuf(normal_log.rdbuf());
   TestSnapshotRetentionUsesPromptBoundary();
   std::clog.rdbuf(previous);
-  Expect(normal_log.str().empty(), "routine cache replacement stays quiet");
+  Expect(normal_log.str().find("action=removed") == std::string::npos &&
+             normal_log.str().find("action=skipped") == std::string::npos,
+         "routine cache replacement stays quiet");
+
+  std::ostringstream eviction_log;
+  previous = std::clog.rdbuf(eviction_log.rdbuf());
+  TestEntryCapacityEvictionIsLogged();
+  std::clog.rdbuf(previous);
+  Expect(
+      eviction_log.str().find("action=removed") != std::string::npos &&
+          eviction_log.str().find("reason=entry_capacity") != std::string::npos,
+      "evicting a retained prefix for entry capacity is reported");
+
+  TestSnapshotCacheCapacityIsReportedAtStartup();
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestMeasuredStateIsReconciledWithClaim();

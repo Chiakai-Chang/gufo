@@ -33,6 +33,15 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
+if (WIN32)
+  # vcpkg ships libwebp as a CMake package, not a pkg-config module
+  find_package(WebP CONFIG REQUIRED)
+  set(GUFO_WEBP_TARGET WebP::webp)
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(WEBP REQUIRED IMPORTED_TARGET libwebp)
+  set(GUFO_WEBP_TARGET PkgConfig::WEBP)
+endif()
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
@@ -156,7 +165,7 @@ target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
 target_link_libraries(gufo_core PUBLIC gufo_llama_jinja ICU::uc ICU::i18n Threads::Threads
-  PNG::PNG JPEG::JPEG CURL::libcurl OpenSSL::Crypto)
+  PNG::PNG JPEG::JPEG ${GUFO_WEBP_TARGET} CURL::libcurl OpenSSL::Crypto)
 
 add_subdirectory(src/models/qwen)
 add_subdirectory(src/models/qwen_image_21)
@@ -208,6 +217,13 @@ add_library(gufo_logging STATIC src/cli/serve/logging.cpp)
 target_include_directories(gufo_logging PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_logging PUBLIC cxx_std_20)
 
+# The imported DeepSeek V4 Flash runtime routes its informational messages
+# through the shared logger instead of writing to stderr directly, so it needs
+# the threshold that `--log-level` arms.
+if (ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_deepseek_v4_flash PUBLIC gufo_logging)
+endif()
+
 add_library(gufo_http STATIC
   src/cli/serve/image_api.cpp
   src/cli/serve/audio_asr_api.cpp
@@ -226,6 +242,7 @@ target_link_libraries(gufo_http PUBLIC gufo_logging gufo_core gufo_qwen3_tts guf
 
 add_executable(gufo
   src/cli/main.cpp
+  src/cli/banner.cpp
   src/cli/eval/eval.cpp
   src/cli/transcribe/transcribe.cpp
   src/cli/video/video.cpp
@@ -422,7 +439,7 @@ if (BUILD_TESTING)
   add_executable(continuation_cache_test
     tests/cli/continuation_cache_test.cpp
     src/cli/serve/continuation_cache.cpp)
-  target_link_libraries(continuation_cache_test PRIVATE gufo_core)
+  target_link_libraries(continuation_cache_test PRIVATE gufo_core gufo_logging)
   add_test(NAME continuation_cache_test COMMAND continuation_cache_test)
   set_tests_properties(continuation_cache_test PROPERTIES
     LABELS "cpu;server;cache;state;lifecycle")
@@ -551,6 +568,11 @@ if (BUILD_TESTING)
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/serving_bench_test.py)
   set_tests_properties(serving_bench_test PROPERTIES
     LABELS "cpu;tools;server;benchmarks;statistics;json")
+
+  add_test(NAME functional_runner_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/functional/test_runner.py)
+  set_tests_properties(functional_runner_test PROPERTIES LABELS "cpu;server;functional")
 
   add_test(NAME speculative_corpus_test
     COMMAND ${Python3_EXECUTABLE}
