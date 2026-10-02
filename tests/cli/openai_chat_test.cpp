@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "src/core/json.hpp"
+#include "src/core/json_constraint.hpp"
 
 namespace {
 
@@ -211,7 +212,7 @@ gufo::server::HttpRequest Request(
 
 void TestStreamingIsLive() {
   FakeBackend backend;
-  backend.pieces = {"Hel", "lo"};
+  backend.pieces = {"Hel<tool_call>", "lo"};
   backend.finish_reason =
       gufo::server::TextGenerationBackend::FinishReason::kLength;
   backend.block_after_first_piece = true;
@@ -248,7 +249,8 @@ void TestStreamingIsLive() {
     Expect(output_condition.wait_for(
                lock, 2s,
                [&] {
-                 return output.find(R"("content":"Hel")") != std::string::npos;
+                 return output.find(R"("content":"Hel<tool_call>")") !=
+                        std::string::npos;
                }),
            "First content delta is written promptly");
     Expect(!backend.completed.load(),
@@ -661,10 +663,8 @@ void TestToolNameCharacters() {
            "The same name is accepted when a message replays a call");
   }
 
-  // The Qwen and DeepSeek renderers append a name verbatim, so a name that
-  // frames a call is refused at both entry points rather than corrupting one.
-  // Non-ASCII is refused with them: a confusable name reaches the prompt and
-  // the operator's logs, where it can only mislead.
+  // New declarations retain their name restrictions. Historical calls are
+  // records from an earlier turn and must not strand the conversation (#357).
   const std::vector<std::string> unrenderable{"bad>name",
                                               "bad<name",
                                               "bad\"name",
@@ -674,9 +674,9 @@ void TestToolNameCharacters() {
                                               "bad\x7F"
                                               "name",
                                               "outil_traçage",
+                                              "…",
                                               "reаd",
                                               "​read",
-                                              "",
                                               std::string(65, 'n')};
   for (const std::string& name : unrenderable) {
     FakeBackend declared;
@@ -687,18 +687,68 @@ void TestToolNameCharacters() {
                declared.chat_calls == 0,
            "An unrenderable declared name fails with invalid_tools");
 
-    if (name.empty())
-      continue;  // An empty replayed name has its own error message.
-    // Messages parse before tools, so a replayed name reports the message
-    // code. Both routes refuse the name; only the code differs.
     FakeBackend replayed;
     const auto replay_response =
         gufo::server::HandleOpenAiChat(Request(replay(name)), replayed);
-    Expect(replay_response.status == 400 &&
-               replay_response.body.find("invalid_messages") !=
-                   std::string::npos &&
-               replayed.chat_calls == 0,
-           "An unrenderable replayed name fails with invalid_messages");
+    Expect(replay_response.status == 200 && replayed.chat_calls == 1 &&
+               replayed.last_request.messages[1].tool_calls[0].name == name &&
+               replayed.last_request.messages[1].tool_calls[0].id == "call_1" &&
+               replayed.last_request.messages[2].tool_call_id == "call_1",
+           "Historical names and result pairing survive unchanged");
+
+    auto item = gufo::json::parse(
+        R"({"type":"function_call","call_id":"call_1","name":"placeholder",
+            "arguments":"{\"path\":\"a.txt\"}"})");
+    item["name"] = name;
+    gufo::tokenization::ChatMessage message;
+    gufo::core::ImageReadBudget budget;
+    std::string error;
+    Expect(gufo::server::ParseOpenAiResponseMessage(item, &message, budget,
+                                                    &error) &&
+               message.tool_calls.size() == 1 &&
+               message.tool_calls[0].name == name &&
+               message.tool_calls[0].id == "call_1" &&
+               message.tool_calls[0].arguments[0].value == "a.txt",
+           "Responses preserves the same historical names and arguments");
+  }
+}
+
+void TestMalformedHistoricalFunctions() {
+  for (const auto source :
+       {R"({"arguments":"{}"})", R"({"name":"","arguments":"{}"})",
+        R"({"name":null,"arguments":"{}"})", R"({"name":42,"arguments":"{}"})",
+        R"({"name":"read"})", R"({"name":"read","arguments":{}})",
+        R"({"name":"read","arguments":null})",
+        R"({"name":"read","arguments":"[]"})",
+        R"({"name":"read","arguments":"["})",
+        R"({"name":"read","arguments":"{\"x\":\"raw\nnewline\"}"})",
+        R"({"name":"read\u0000file","arguments":"{}"})"}) {
+    const auto function = gufo::json::parse(source);
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"continue"}]
+    })");
+    auto assistant =
+        gufo::json::parse(R"({"role":"assistant","tool_calls":[]})");
+    auto call = gufo::json::parse(R"({"id":"call_1","type":"function"})");
+    call["function"] = function;
+    assistant["tool_calls"].push_back(std::move(call));
+    body["messages"].push_back(std::move(assistant));
+    FakeBackend backend;
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 400 && backend.chat_calls == 0 &&
+               response.body.find("invalid_messages") != std::string::npos,
+           "Malformed history is rejected before model work");
+    auto item = function;
+    item["type"] = "function_call";
+    item["call_id"] = "call_1";
+    gufo::tokenization::ChatMessage message;
+    gufo::core::ImageReadBudget budget;
+    std::string error;
+    Expect(!gufo::server::ParseOpenAiResponseMessage(item, &message, budget,
+                                                     &error) &&
+               !error.empty(),
+           "Responses rejects malformed history with an explanation");
   }
 }
 
@@ -2232,6 +2282,102 @@ void TestToolMarkersInsideConstrainedReasoning() {
           }
 }
 
+void TestToolMarkersWhenToolsDisabled() {
+  using gufo::json::Value;
+  const std::string thought =
+      "Quoted <tool_call> and <｜DSML｜tool_calls> are reasoning data.";
+  const std::string answer =
+      "Literal <tool_call><function=f></function></tool_call> end.";
+  for (const bool responses : {false, true})
+    for (const bool stream : {false, true})
+      for (const bool declared : {false, true})
+        for (const int phase : {0, 1, 2}) {
+          auto body = gufo::json::parse(R"({
+            "model":"test-model","messages":[{"role":"user","content":"Explain syntax"}],
+            "tool_choice":"none"})");
+          body["stream"] = stream;
+          body["chat_template_kwargs"]["enable_thinking"] = phase != 0;
+          if (declared)
+            body["tools"] =
+                gufo::json::parse(R"([{"type":"function","function":{
+              "name":"f","parameters":{"type":"object","properties":{},"additionalProperties":false}}}])");
+          const bool incomplete = phase == 2;
+          const auto expected_thought = phase ? thought : std::string{};
+          const auto expected_answer = incomplete ? std::string{} : answer;
+          const auto raw = expected_thought + (phase == 1 ? "</think>" : "") +
+                           expected_answer;
+          FakeBackend backend;
+          backend.finish_reason =
+              incomplete
+                  ? gufo::server::TextGenerationBackend::FinishReason::kLength
+                  : gufo::server::TextGenerationBackend::FinishReason::kStop;
+          for (char byte : raw)
+            backend.pieces.emplace_back(1, byte);
+          gufo::server::HttpResponse response;
+          if (responses) {
+            if (declared) {
+              auto tool = *body["tools"].items()[0].find("function");
+              tool["type"] = "function";
+              body["tools"] = Value::array();
+              body["tools"].push_back(std::move(tool));
+            }
+            gufo::server::ChatRequest chat;
+            chat.reasoning.enabled = phase != 0;
+            Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+                   "disabled tools have valid Responses controls");
+            response = gufo::server::CreateOpenAiResponse(
+                Request(body.dump()), backend, chat, 4096, {}, stream);
+          } else
+            response =
+                gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+          std::string text, reasoning;
+          const auto inspect = [&](const Value& event) {
+            if (responses) {
+              if (stream) {
+                if (event.member_str("type") == "response.output_text.delta")
+                  text += event.member_str("delta");
+                if (event.member_str("type") ==
+                    "response.reasoning_summary_text.delta")
+                  reasoning += event.member_str("delta");
+              } else
+                for (const auto& item : event.find("output")->items()) {
+                  Expect(item.member_str("type") != "function_call",
+                         "disabled tools never become API calls");
+                  for (const auto* field : {"content", "summary"})
+                    if (const auto* parts = item.find(field))
+                      for (const auto& part : parts->items())
+                        (std::string_view(field) == "content" ? text
+                                                              : reasoning) +=
+                            part.member_str("text");
+                }
+            } else
+              for (const auto& choice : event.find("choices")->items()) {
+                const auto* message = choice.find(stream ? "delta" : "message");
+                if (!message)
+                  continue;
+                Expect(!message->contains("tool_calls"),
+                       "disabled tools never become API calls");
+                text += message->member_str("content");
+                reasoning += message->member_str("reasoning_content");
+              }
+          };
+          Expect(response.status == 200,
+                 "disabled tool marker request succeeds");
+          if (stream)
+            response.streaming_body([&](std::string_view chunk) {
+              const auto pos = chunk.find("data: ");
+              if (pos != std::string_view::npos &&
+                  !chunk.substr(pos + 6).starts_with("[DONE]"))
+                inspect(gufo::json::parse(chunk.substr(pos + 6)));
+              return true;
+            });
+          else
+            inspect(gufo::json::parse(response.body));
+          Expect(text == expected_answer && reasoning == expected_thought,
+                 "disabled tool markers preserve content and reasoning phases");
+        }
+}
+
 void TestNativeToolTransports() {
   using gufo::json::Value;
   using Finish = gufo::server::TextGenerationBackend::FinishReason;
@@ -2446,6 +2592,80 @@ void TestNativeReferencedArgumentTypes() {
     }
 }
 
+void TestWildcardToolTypes() {
+  using gufo::json::Value;
+  using Constraint = gufo::sampling::JsonConstraint;
+  using Format = Constraint::ToolFormat;
+  const auto schema = gufo::json::parse(R"({"type":"object",
+    "properties":{"value":{"type":"string"}},"required":["value"],
+    "patternProperties":{"^x_":{"type":"integer"}}})");
+  const auto arguments = gufo::json::parse(
+      R"({"value":"alpha","x_n":1,"x_b":true,"x_z":null,"x_a":[1],"x_o":{"n":1},"x_s":"1"})");
+  for (const auto native : {Format::kQwen, Format::kDeepSeek}) {
+    auto parameters = Constraint::ToolParameters(schema, false, native);
+    const auto format = parameters ? native : Format::kJson;
+    if (!parameters)
+      parameters = Constraint::ToolParameters(schema, false, format);
+    const auto grammar = Constraint::WithTools(
+        nullptr, {{"record", parameters}}, true, false, format);
+    std::string call;
+    if (format == Format::kJson) {
+      call =
+          "<tool_call>{\"name\":\"record\",\"arguments\":" + arguments.dump() +
+          "}</tool_call>";
+    } else {
+      call = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"record\">\n";
+      for (const auto& [name, value] : arguments.members())
+        call += "<｜DSML｜parameter name=\"" + name + "\" string=\"" +
+                (value.is_string() ? "true" : "false") + "\">" +
+                (value.is_string() ? value.str() : value.dump()) +
+                "</｜DSML｜parameter>\n";
+      call += "</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    }
+    auto state = grammar->Start();
+    for (unsigned char byte : call)
+      state = grammar->Advance(state, byte);
+    Expect(grammar->Complete(state), "round-trip call is grammar-admissible");
+    for (bool responses : {false, true}) {
+      auto body = gufo::json::parse(R"({"model":"test-model",
+        "messages":[{"role":"user","content":"call record"}],
+        "tools":[{"type":"function","function":{"name":"record","strict":false}}],
+        "tool_choice":"auto"})");
+      auto tool = body["tools"].items()[0];
+      tool["function"]["parameters"] = schema;
+      body["tools"] = Value::array();
+      body["tools"].push_back(std::move(tool));
+      FakeBackend backend;
+      backend.pieces = {call};
+      gufo::server::HttpResponse response;
+      if (responses) {
+        gufo::server::ChatRequest chat;
+        Expect(!gufo::server::ParseOpenAiResponseControls(body, &chat),
+               "wildcard Responses controls are accepted");
+        response = gufo::server::CreateOpenAiResponse(
+            Request(body.dump()), backend, chat, 256, {}, false);
+      } else {
+        response =
+            gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+      }
+      Expect(response.status == 200, "wildcard call succeeds");
+      const auto output = gufo::json::parse(response.body);
+      const auto encoded =
+          responses
+              ? output.find("output")->items().back().member_str("arguments")
+              : output.find("choices")
+                    ->items()[0]
+                    .find("message")
+                    ->find("tool_calls")
+                    ->items()[0]
+                    .find("function")
+                    ->member_str("arguments");
+      Expect(encoded == arguments.dump(),
+             "wildcard JSON types survive transport");
+    }
+  }
+}
+
 void TestToolMetadataAndFraming() {
   using gufo::json::Value;
   auto body = gufo::json::parse(R"({
@@ -2598,7 +2818,7 @@ void TestResponsesOutput() {
 
 void TestResponsesLiveAndCancellation() {
   FakeBackend backend;
-  backend.pieces = {"first", "second"};
+  backend.pieces = {"<tool_call>first", "second"};
   backend.block_after_first_piece = true;
   auto response = gufo::server::CreateOpenAiResponse(Request("{}"), backend, {},
                                                      0, {}, true);
@@ -2729,6 +2949,7 @@ int main() {
   TestStreamingPromptProgress();
   TestResponsesPromptProgress();
   TestToolMarkersInsideConstrainedReasoning();
+  TestToolMarkersWhenToolsDisabled();
   TestStopSequencesAndDefaultFields();
   TestStructuredResponseFormat();
   TestStructuredToolTruncation();
@@ -2738,6 +2959,7 @@ int main() {
   TestResponsesOutput();
   TestNativeToolTransports();
   TestNativeReferencedArgumentTypes();
+  TestWildcardToolTypes();
   TestToolMetadataAndFraming();
   TestResponsesLiveAndCancellation();
   TestCachePromptOption();
@@ -2762,6 +2984,7 @@ int main() {
   TestToolParameterCompatibility();
   TestInvalidToolsFailBeforeGeneration();
   TestToolNameCharacters();
+  TestMalformedHistoricalFunctions();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
   TestDeepSeekRepeatedToolParameters();

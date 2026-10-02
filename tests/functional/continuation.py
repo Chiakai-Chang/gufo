@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 import socket
 import time
+from tool_agent import agent_tools
 from urllib.parse import urlsplit
 from metrics import Recorder
 
@@ -108,6 +109,8 @@ def main():
                         help="Effort for thinking-on cases; thinking-off cases remain off")
     parser.add_argument("--tools", action="store_true",
                         help="Resume after a completed tool response")
+    parser.add_argument("--legacy-tool-history", action="store_true",
+                        help="Also replay an unknown historical name after the ordinary tool")
     parser.add_argument("--discard-assistant", action="store_true",
                         help="Drop the interrupted assistant and send '.' like an agent client")
     parser.add_argument("--drop-reasoning", action="store_true",
@@ -120,6 +123,8 @@ def main():
     TRACE.path = args.output.with_suffix(".requests.json")
     if args.append_image and not args.image:
         parser.error("--append-image requires --image")
+    if args.legacy_tool_history and not args.tools:
+        parser.error("--legacy-tool-history requires --tools")
     reports = []
     if args.restore:
         previous = json.loads(args.restore.read_text())
@@ -174,6 +179,13 @@ def main():
                              "name": "read_fixture", "arguments": "{}"}}]},
                         {"role": "tool", "tool_call_id": "fixture-call",
                          "content": "The fixture is ready. Answer the user's request directly."}])
+                    if args.legacy_tool_history:
+                        messages.extend([
+                            {"role": "assistant", "content": None, "tool_calls": [{
+                                "id": "legacy-call", "type": "function",
+                                "function": {"name": "…", "arguments": "{}"}}]},
+                            {"role": "tool", "tool_call_id": "legacy-call",
+                             "content": "Unknown tool; no action taken. Continue the user's request."}])
                 body = {"model": args.model, "messages": messages, "max_tokens": 256,
                         "temperature": 0.8 if sampled else 0, "seed": 1234,
                         "top_k": 20, "top_p": 0.95,
@@ -183,7 +195,8 @@ def main():
                 if args.tools:
                     body["tools"] = [{"type": "function", "function": {
                         "name": "read_fixture", "description": "Read the fixture.",
-                        "parameters": {"type": "object", "properties": {}}}}]
+                        "parameters": {"type": "object", "properties": {}}}},
+                        *agent_tools()]
                 if thinking and args.reasoning_effort:
                     body["reasoning_effort"] = args.reasoning_effort
                 initial = {**body, "messages": list(messages),
