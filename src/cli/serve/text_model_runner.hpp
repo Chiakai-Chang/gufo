@@ -42,6 +42,15 @@ struct TextPreparedPrompt {
   std::size_t cache_prefix_tokens{0};
 };
 
+struct TextRunnerRamCacheOptions {
+  static constexpr std::size_t kAutomaticMaxBytes = std::size_t{32} << 30;
+  static constexpr std::size_t kMaxEntries = 128;
+  /// Zero selects min(model snapshot budget, 32 GiB), after session allocation.
+  /// Explicit limits may exceed that budget up to the model's ceiling, which
+  /// keeps kHostSnapshotHeadroomBytes of host RAM free.
+  std::size_t capacity_bytes{0};
+};
+
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
       std::size_t{8} * 1024U * 1024U * 1024U;
@@ -56,10 +65,24 @@ struct TextRunnerDiskCacheOptions {
   std::size_t shared_prefix_min_tokens{128};
   /// Bound on shared-prefix snapshots written while prefilling one request.
   std::size_t shared_prefix_max_boundaries{4};
+  /// Minimum token advance before a checkpoint is worth persisting.
+  ///
+  /// Continuations advance by a few hundred tokens per turn, so persisting
+  /// every turn rewrites a largely identical snapshot. The tokens between two
+  /// checkpoints are cheaper to re-prefill than that write. Zero disables the
+  /// gate.
+  std::size_t min_checkpoint_step_tokens{2048};
 };
 
-/// Host snapshot budget after accounting for cgroup limits and headroom.
+/// Automatic snapshot budget: half the host RAM available after loading,
+/// after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
+/// RAM always left to the OS and other processes by an explicit cache limit.
+inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
+                                                            << 30;
+/// Most an explicit --cache-ram-bytes may claim: available host RAM minus
+/// kHostSnapshotHeadroomBytes.
+[[nodiscard]] std::size_t HostSnapshotCeilingBytes();
 
 enum class TextExecutionPlanKind : std::uint8_t {
   kSerial,
@@ -121,6 +144,9 @@ struct TextRunnerResourceClaim {
   ///
   /// The pool queries this again after creating all mutable request states.
   std::optional<std::size_t> retained_snapshot_capacity_bytes;
+  /// Most an explicit RAM-cache limit may claim. Missing means the automatic
+  /// retained_snapshot_capacity_bytes is also the ceiling.
+  std::optional<std::size_t> retained_snapshot_ceiling_bytes;
   bool requires_device_runtime_lock{false};
 };
 
@@ -310,6 +336,10 @@ public:
   /// Retain a safe executed frontier when cancellation interrupts publication
   /// of a completed speculative block. Called with cancellation checks cleared.
   virtual void PrepareCancellation(TextRunnerState&) const {}
+  /// Bounded check, run only after a failed work unit, that the execution
+  /// device still accepts work. False means the context is permanently lost;
+  /// a probe that is still pending at its bound reports true.
+  [[nodiscard]] virtual bool DeviceUsable() const { return true; }
 
   /// Captures an immutable exact continuation at CheckpointPosition(state).
   ///
@@ -394,6 +424,28 @@ public:
     [[nodiscard]] bool cache_disk_hit() const noexcept;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;
     [[nodiscard]] bool prefill_complete() const noexcept;
+    [[nodiscard]] std::span<const TextRunnerToken> prompt() const noexcept;
+    /// Prompt tokens already in model state, restored or prefilled.
+    [[nodiscard]] std::size_t prefill_position() const noexcept;
+    [[nodiscard]] std::span<const std::uint8_t> input_identity(
+        std::size_t token_count) const;
+
+    /// Lets another request reuse this prompt's first common_tokens.
+    ///
+    /// Returns the position, at most common_tokens, where this request will
+    /// publish a RAM checkpoint before prefilling past it, reusing a planned
+    /// checkpoint within kSharedCheckpointSlack tokens. Zero when the runner
+    /// cannot snapshot or this request is no longer before that position.
+    /// Other requests depend on it, waiting now or arriving later, so it is
+    /// retained with continuation priority rather than as an optional copy.
+    [[nodiscard]] std::size_t ShareCheckpoint(std::size_t common_tokens);
+    /// A planned checkpoint this close to the shared position is cheaper to
+    /// use than capturing another one: followers prefill the gap themselves.
+    static constexpr std::size_t kSharedCheckpointSlack = 64;
+    /// A shared prefix must add at least this many tokens to what a request
+    /// can already restore before it waits for a peer or captures an extra
+    /// checkpoint for later requests. Shorter gaps cost less to prefill again.
+    static constexpr std::size_t kSharedPrefixMinTokens = 512;
 
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
@@ -427,7 +479,8 @@ public:
 
   TextRunnerPool(
       std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
-      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt);
+      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt,
+      TextRunnerRamCacheOptions ram_cache = {});
   ~TextRunnerPool();
 
   TextRunnerPool(const TextRunnerPool&) = delete;
@@ -453,6 +506,11 @@ public:
       bool stop_at_eos = true);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
+  /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
+  /// leasing a state. An upper bound: Acquire may still prefer a shorter one.
+  [[nodiscard]] std::size_t CachedPrefixTokens(
+      std::span<const TextRunnerToken> prompt,
+      const TextPromptContext* context) const;
 
 private:
   struct Impl;

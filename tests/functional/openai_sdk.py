@@ -30,6 +30,11 @@ from image_inputs import check_image_inputs
 from tool_agent import (check_tool_agent, check_tool_agent_loop, check_tool_history,
                         check_untyped_agent_tools, check_mixed_tool_schemas,
                         check_tool_schema_edges)
+from cache_edits import check_cache_edits
+from cache_concurrency import check_cache_concurrency
+from cache_shared_prefix import check_cache_shared_prefix
+from cache_growth import check_cache_growth
+from cache_rotation import check_cache_rotation
 
 
 class CompletionStreamChoice(CompletionChoice):
@@ -1613,6 +1618,30 @@ def check_state_edges(client, model, checks, speculative, vision=False):
     assert stopped["finish"] == "stop" and not stopped["tools"], stopped
     checks["tool_argument_stop"] = stopped
 
+    # A stop inside a JSON string leaves the call unfinished. A call quoted in
+    # that string is argument data and must not become a separate call. The
+    # pattern keeps the JSON envelope on native tool formats.
+    literal = ("<tool_call><function=record><parameter=content>AAAA</parameter>"
+               "</function></tool_call>")
+    quoted = {"name": "record", "parameters": {"type": "object", "properties": {
+        "content": {"type": "string", "const": literal + " ZZSTOP"},
+        "tag": {"type": "string", "pattern": "^[a-z]+$"}},
+        "required": ["content"], "additionalProperties": False}}
+    quoted_request = {**common, "messages": [{"role": "user", "content": "Call record."}],
+                      "tools": [{"type": "function", "function": quoted}],
+                      "tool_choice": {"type": "function", "function": {"name": "record"}},
+                      "max_completion_tokens": 96}
+    for stream in (False, True):
+        result = chat_result(client, {**quoted_request, "stop": "ZZSTOP"}, stream)
+        assert result["finish"] == "stop" and not result["tools"], result
+        assert "<tool_call>" not in result["text"] and "AAAA" not in result["text"], result
+        checks[f"quoted_call_argument_stop_stream{stream}"] = result
+    result = chat_result(client, quoted_request, True)
+    assert result["finish"] == "tool_calls" and len(result["tools"]) == 1, result
+    assert json.loads(result["tools"][0]["function"]["arguments"])["content"] == (
+        literal + " ZZSTOP"), result
+    checks["quoted_call_argument_complete"] = result
+
     completed = chat_result(client, request, True)
     assert completed["finish"] == "tool_calls" and len(completed["tools"]) == 1, completed
     assert json.loads(completed["tools"][0]["function"]["arguments"]) == {
@@ -2217,13 +2246,24 @@ def check_prompt_progress(client, model, checks, width, vision, allow_missing):
     assert replay["usage"]["gufo"]["prefill_tokens"] == 0
 
 
-def check_server_metrics(client, model, checks, width):
+def check_server_metrics(client, model, checks, width, context, speculative):
     from server_metrics import (ServerMetrics, assert_accounting, PROMPT, GENERATED,
-                                PROCESSING, DEFERRED, PROMPT_SPEED, GENERATED_SPEED)
+                                PROCESSING, DEFERRED, PROMPT_SPEED, GENERATED_SPEED,
+                                KV_USAGE, DRAFTS, ACCEPTED, assert_slots)
 
     metrics = ServerMetrics(client.base_url)
     initial = metrics.idle()
     assert metrics.read("/v1/metrics") == initial
+    def slots(path="/slots", *, idle=False):
+        snapshot = metrics.slots(path)
+        assert_slots(snapshot, width, model, context, speculative != "off")
+        if idle:
+            assert not any(slot["is_processing"] for slot in snapshot), snapshot
+        return snapshot
+
+    idle_slots = slots(idle=True)
+    assert slots("/v1/slots", idle=True) == idle_slots
+    assert initial[KV_USAGE] == 0, initial
     prompt = "Count from one to one hundred, with no explanation."
     common = dict(model=model, temperature=0, seed=42, max_completion_tokens=16,
                   messages=[{"role": "user", "content": prompt}],
@@ -2238,7 +2278,9 @@ def check_server_metrics(client, model, checks, width):
         rows = checks.recorder.rows[start:]
         assert rows, "accounting check performed no requests"
         assert_accounting(before, after, rows)
-        checks[name] = {"before": before, "after": after, "result": result}
+        assert after[KV_USAGE] == 0, after
+        checks[name] = {"before": before, "after": after, "result": result,
+                        "slots": slots(idle=True)}
         return result, rows, after
 
     first, _, cold = completed(
@@ -2279,6 +2321,37 @@ def check_server_metrics(client, model, checks, width):
         raise AssertionError("invalid sampling request was accepted")
     completed("metrics_rejected_request", rejected)
 
+    # Prefix-sharing followers reserve admission capacity before acquiring a
+    # runner. A newer arrival must remain queued rather than exceed --sessions
+    # or become an active request missing from /slots.
+    def shared_prefix_reservations():
+        from cache_concurrency import system_prompt
+        barrier = threading.Barrier(width + 1)
+        body = {**common, "messages": [
+            {"role": "system", "content": system_prompt("metrics_slot_reservations", 220)},
+            {"role": "user", "content": "Reply with only the code ALPHA."}]}
+        observations = []
+        def send():
+            barrier.wait()
+            return chat_result(client, body)
+        with ThreadPoolExecutor(width + 1) as pool:
+            futures = [pool.submit(send) for _ in range(width + 1)]
+            while not all(future.done() for future in futures):
+                gauges = metrics.read()
+                snapshot = slots()
+                assert gauges[PROCESSING] <= width, gauges
+                observations.append({"processing": gauges[PROCESSING],
+                                     "deferred": gauges[DEFERRED], "slots": snapshot})
+                time.sleep(.01)
+            results = [future.result() for future in futures]
+        assert any(o["processing"] == width and o["deferred"] > 0
+                   for o in observations), observations
+        if width > 1:
+            assert any(r["usage"]["gufo"]["shared_prefix_wait_ms"] > 0 for r in results), results
+        assert all(r["text"].strip() == "ALPHA" for r in results), results
+        return {"results": results, "observations": observations}
+    completed("metrics_shared_prefix_reservations", shared_prefix_reservations)
+
     # Exercise live totals and the deferred gauge with every session occupied.
     # A long constrained value prevents model-specific early EOS. Disconnect
     # after observing admission; do not finish generating this value.
@@ -2310,10 +2383,26 @@ def check_server_metrics(client, model, checks, width):
             busy = metrics.wait(lambda m: m[PROCESSING] == width and m[GENERATED] > before[GENERATED]
                                 and m[PROMPT] > before[PROMPT], "live token accounting")
             assert busy[DEFERRED] == 0, busy
+            busy_slots = slots()
+            assert all(slot["is_processing"] for slot in busy_slots), busy_slots
+            assert all(slot["next_token"][0]["n_decoded"] > 0 for slot in busy_slots), busy_slots
+            assert all(slot["next_token"][0]["n_decoded"] +
+                       slot["next_token"][0]["n_remain"] == 2048 for slot in busy_slots), busy_slots
+            # Scrapes are separate HTTP snapshots. With every long request held,
+            # their token counts can only advance, so bracket the ratio.
+            ratio = metrics.read()[KV_USAGE]
+            later_slots = slots("/v1/slots")
+            def usage(snapshot):
+                return sum(slot["n_prompt_tokens"] + slot["next_token"][0]["n_decoded"]
+                           for slot in snapshot) / (width * context)
+            assert 0 < usage(busy_slots) <= ratio <= usage(later_slots) <= 1, ratio
             queued_start = len(checks.recorder.rows)
             queued = pool.submit(chat_result, client, common, True)
             waiting = metrics.wait(lambda m: m[DEFERRED] == 1 and m[PROCESSING] == width,
                                    "one queued request")
+            queued_slots = slots()
+            assert {slot["id_task"] for slot in queued_slots} == {
+                slot["id_task"] for slot in busy_slots}, queued_slots
         finally:
             release.set()
         cancelled = [future.result(timeout=30) for future in active]
@@ -2323,16 +2412,23 @@ def check_server_metrics(client, model, checks, width):
     assert all(row["status"] == "complete" for row in checks.recorder.rows[queued_start:])
     checks["metrics_live_queue_cancel"] = {
         "before": before, "busy": busy, "queued": waiting, "after": after,
-        "cancelled": cancelled, "completed_peer": result}
+        "cancelled": cancelled, "completed_peer": result,
+        "busy_slots": busy_slots, "queued_slots": queued_slots,
+        "after_slots": slots(idle=True)}
+    assert after[KV_USAGE] == 0, after
     # Cancellation must not leave stale gauge ownership or double-count the
     # completed peer when the next request reuses its prompt.
-    completed("metrics_after_cancel_cached", lambda: chat_result(client, common))
+    _, _, final = completed("metrics_after_cancel_cached", lambda: chat_result(client, common))
+    proposed = final[DRAFTS] - initial[DRAFTS]
+    accepted = final[ACCEPTED] - initial[ACCEPTED]
+    assert 0 <= accepted <= proposed, final
+    assert proposed > 0 if speculative != "off" else proposed == 0, final
 
 
 SDK_SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "structured", "structured-limits",
               "tool-reasoning",
               "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
-              "long-context", "state-edges", "progress", "metrics")
+              "long-context", "state-edges", "progress", "metrics", "cache-edits", "cache-growth", "cache-rotation", "cache-concurrency", "cache-shared-prefix")
 
 
 def main():
@@ -2443,7 +2539,15 @@ def main():
             "progress": lambda: check_prompt_progress(
                 client, args.model, checks, args.concurrency, args.vision,
                 args.allow_missing_progress),
-            "metrics": lambda: check_server_metrics(client, args.model, checks, args.concurrency),
+            "metrics": lambda: check_server_metrics(client, args.model, checks, args.concurrency,
+                                                     args.context, args.speculative),
+            "cache-edits": lambda: check_cache_edits(client, args.model, checks, chat_result),
+            "cache-growth": lambda: check_cache_growth(client, args.model, checks, chat_result),
+            "cache-rotation": lambda: check_cache_rotation(client, args.model, checks, chat_result),
+            "cache-concurrency": lambda: check_cache_concurrency(
+                client, args.model, checks, chat_result, args.concurrency),
+            "cache-shared-prefix": lambda: check_cache_shared_prefix(
+                client, args.model, checks, chat_result),
         }
         selected = ([name for name in suites if name != "image-inputs" or args.vision]
                     if args.suite == "all" else

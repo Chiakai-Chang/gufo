@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -30,7 +31,7 @@ TESTS = Path(__file__).resolve().parent
 SUITES = ("discovery", "responses", "stops", "conversation", "image-inputs", "structured", "structured-limits",
           "tool-reasoning",
           "tools", "auto-tools", "tool-edges", "tool-agent", "tool-agent-loop", "tool-history", "tool-untyped", "tool-mixed", "tool-schema-edges", "sampling-defaults", "sampling-ranges", "batch",
-          "long-context", "state-edges", "progress", "metrics", "cache")
+          "long-context", "state-edges", "progress", "metrics", "cache-edits", "cache-growth", "cache-rotation", "cache-concurrency", "cache-shared-prefix", "cache")
 SAMPLING = {
     "--temperature": ("temperature", float), "--top-p": ("top_p", float),
     "--top-k": ("top_k", int), "--min-p": ("min_p", float),
@@ -48,7 +49,8 @@ COMPARISON_FIELDS = ("comparison_command", "sampling_preset", "sampling_override
 def provenance():
     source = hashlib.sha256()
     for name in ("run.py", "metrics.py", "progress.py", "server_metrics.py", "openai_sdk.py", "continuation.py",
-                 "tool_reasoning.py", "tool_agent.py", "discovery.py", "image_inputs.py"):
+                 "tool_reasoning.py", "tool_agent.py", "discovery.py", "image_inputs.py", "cache_edits.py", "cache_growth.py", "cache_rotation.py", "cache_concurrency.py", "cache_shared_prefix.py",
+                 "cache_disk_spacing.py"):
         source.update((TESTS / name).read_bytes())
     lock = TESTS.parents[1] / "flake.lock"
     kernel_command = Path("/proc/cmdline")
@@ -356,10 +358,18 @@ def main():
                                       "--image", str(output / "red.png")]),
         ]
     ready_to_restore = []
+    spacing = False
     try:
+        if "cache-rotation" in selected:
+            from cache_rotation import check_snapshot_budget, host_available_bytes
+            available_before_load = host_available_bytes(Path("/proc/meminfo").read_text())
         startup_started = time.monotonic()
         with server(command, output / "server.log", args.startup_timeout):
             report["startup_ms"] = (time.monotonic() - startup_started) * 1000
+            if "cache-rotation" in selected:
+                report["snapshot_budget"] = check_snapshot_budget(
+                    (output / "server.log").read_text(), available_before_load,
+                    int(option(command, "--cache-ram-bytes", "0")), sessions)
             for suite in selected:
                 if suite == "cache":
                     continue
@@ -386,7 +396,12 @@ def main():
                             "--url", base_url, "--model", model, "--prefix-repetitions", "16",
                             "--output", str(output / (label + ".json")), *extra]):
                         ready_to_restore.append(label)
-        if ready_to_restore:
+                # Last, so the drained log after this offset belongs to it.
+                spacing_offset = (output / "server.log").stat().st_size
+                spacing = run("disk-spacing", "cache_disk_spacing.py", [
+                    "--url", base_url, "--model", model,
+                    "--output", str(output / "disk-spacing.json")])
+        if ready_to_restore or spacing:
             startup_started = time.monotonic()
             with server(command, output / "server-restarted.log", args.startup_timeout):
                 report["restart_ms"] = (time.monotonic() - startup_started) * 1000
@@ -395,6 +410,19 @@ def main():
                         "--url", base_url, "--model", model,
                         "--restore", str(output / (label + ".json")),
                         "--output", str(output / (label + "-disk.json"))])
+                if spacing:
+                    spacing = run("disk-spacing-disk", "cache_disk_spacing.py", [
+                        "--url", base_url, "--model", model,
+                        "--restore", str(output / "disk-spacing.json"),
+                        "--output", str(output / "disk-spacing-disk.json")])
+        if spacing:
+            from cache_disk_spacing import check_disk_spacing
+            with (output / "server.log").open() as log:
+                log.seek(spacing_offset)
+                grown_log = log.read()
+            report["disk_spacing"] = check_disk_spacing(
+                grown_log, (output / "server-restarted.log").read_text(),
+                json.loads((output / "disk-spacing.json").read_text())[0])
     except Exception as error:
         report["error"] = str(error)
         report["traceback"] = traceback.format_exc()
@@ -402,6 +430,11 @@ def main():
         report["status"] = "interrupted"
         write_json(report_path, report)
         raise
+    finally:
+        # The servers have exited. Each run's snapshots can fill the whole
+        # disk budget, and the restart checks were their only reader.
+        if disk_enabled:
+            shutil.rmtree(output / "disk", ignore_errors=True)
     report["status"] = ("passed" if report["suites"] and "error" not in report
                         and all(row["status"] == "passed" for row in report["suites"].values())
                         else "failed")

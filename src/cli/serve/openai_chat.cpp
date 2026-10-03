@@ -1204,11 +1204,33 @@ void ParseQwenCalls(
       complete = valid && consume("</function>") &&
                  (consume(end) || Trim(body).empty());
     } else {
-      // JSON calls already encode their argument types. Try closing markers
-      // until the preceding payload is complete JSON (a marker in a quoted
-      // string cannot terminate the call).
+      // Recovery boundaries belong to the envelope, not quoted JSON data.
+      // An unfinished string owns the remaining bytes, including tool tags.
+      bool in_string = false;
+      bool escaped = false;
       std::size_t close = 0;
-      while ((close = body.find(end, close)) != std::string_view::npos) {
+      for (; close < body.size(); ++close) {
+        const char byte = body[close];
+        if (in_string) {
+          if (escaped)
+            escaped = false;
+          else if (byte == '\\')
+            escaped = true;
+          else if (byte == '"')
+            in_string = false;
+          continue;
+        }
+        if (byte == '"') {
+          in_string = true;
+          continue;
+        }
+        if (body.substr(close).starts_with(end) ||
+            body.substr(close).starts_with(start))
+          break;
+      }
+      cursor = static_cast<std::size_t>(body.data() - text.data()) + close;
+      if (body.substr(close).starts_with(end)) {
+        cursor += end.size();
         const auto parsed = TryParseJson(Trim(body.substr(0, close)));
         if (parsed && parsed->is_object()) {
           call.name = parsed->member_str("name");
@@ -1222,9 +1244,7 @@ void ParseQwenCalls(
             complete = true;
             body.remove_prefix(close + end.size());
           }
-          break;
         }
-        close += end.size();
       }
     }
     if (complete) {
@@ -1638,6 +1658,7 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
       result.requested_logical_concurrency;
   metrics["physical_execution_width"] = result.physical_execution_width;
   metrics["queue_ms"] = result.queue_ms;
+  metrics["shared_prefix_wait_ms"] = result.shared_prefix_wait_ms;
   metrics["prefill_ms"] = result.prefill_ms;
   metrics["decode_ms"] = result.decode_ms;
   metrics["ttft_ms"] = result.ttft_ms;
@@ -2394,15 +2415,17 @@ HttpResponse StreamingResponse(
               error["error"] = std::move(detail);
               stream_log->error_event_sent = writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
               stream_log->error_code = "generation_failed";
-              json::Value error = json::Value::object();
+              json::Value err = json::Value::object();
               json::Value detail = json::Value::object();
-              detail["message"] = "generation failed";
+              const char* message = error.what();
+              detail["message"] =
+                  message && *message ? message : "generation failed";
               detail["type"] = "server_error";
               detail["code"] = "generation_failed";
-              error["error"] = std::move(detail);
-              stream_log->error_event_sent = writer(Sse(error));
+              err["error"] = std::move(detail);
+              stream_log->error_event_sent = writer(Sse(err));
               (void)writer("data: [DONE]\n\n");
             }
           },
@@ -2562,6 +2585,14 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
   return {};
 }
 
+GeneratedText SplitGeneratedText(
+    std::string_view text, TextGenerationBackend::InitialOutputState initial) {
+  auto generated =
+      ParseGeneration(text, initial, {}, ChatRequest::ToolChoice::kNone, false);
+  return {.reasoning = std::move(generated.reasoning_content),
+          .text = std::move(generated.text)};
+}
+
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   TextGenerationBackend& backend,
                                   const ChatRequest& chat,
@@ -2655,8 +2686,9 @@ HttpResponse CreateOpenAiResponse(const HttpRequest& request,
       stream_log->error_code = generation_error
                                    ? generation_error->stable_code()
                                    : "generation_failed";
+      const char* message = error.what();
       stream_log->error_event_sent =
-          output.Fail(generation_error ? error.what() : "generation failed");
+          output.Fail(message && *message ? message : "generation failed");
       generation->Cancel();
       return json::Value();
     }

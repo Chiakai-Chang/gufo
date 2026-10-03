@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -167,6 +169,32 @@ void ReportTerminationReason() {
     }
     std::abort();
   });
+}
+
+// Exit status after the GPU context is lost (EX_TEMPFAIL). Only a new process
+// recovers, so a supervisor must restart it.
+constexpr int kDeviceLostExitStatus = 75;
+
+// A lost GPU context cannot recover in-process. Leave through the SIGTERM
+// shutdown path so a supervisor restarts the server, and bound that teardown:
+// joining requests or freeing device memory may block on the dead device.
+void ShutdownAfterDeviceLoss() {
+  constexpr auto kShutdownTimeout = std::chrono::seconds(10);
+  // Arm the watchdog before logging or shutdown: neither a blocked log sink
+  // nor a dead-device join may prevent the forced exit.
+  try {
+    std::thread([kShutdownTimeout] {
+      std::this_thread::sleep_for(kShutdownTimeout);
+      ::_exit(kDeviceLostExitStatus);
+    }).detach();
+  } catch (...) {
+    ::_exit(kDeviceLostExitStatus);
+  }
+  server::Logger::Error(
+      "server", "event=device_lost_shutdown exit_status=" +
+                    std::to_string(kDeviceLostExitStatus) +
+                    " timeout_s=" + std::to_string(kShutdownTimeout.count()));
+  (void)std::raise(SIGTERM);
 }
 
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
@@ -578,6 +606,7 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
+    std::size_t cache_ram_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -690,6 +719,11 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    parser.AddOption(
+        "", "--cache-ram-bytes", "N",
+        "Retained RAM-cache byte budget (default: 0 = auto: half of free "
+        "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB)",
+        "Cache", &cache_ram_bytes);
     parser.AddOption("", "--cache-disk", "DIR",
                      "Opt-in restart-safe continuation cache directory",
                      "Cache", &cache_disk_directory);
@@ -1125,6 +1159,7 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
+    std::size_t cache_ram_bytes = 0;
     std::filesystem::path cache_disk_directory;
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
@@ -1233,6 +1268,11 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddOption(
+        "", "--cache-ram-bytes", "N",
+        "Retained RAM-cache byte budget (default: 0 = auto: half of free "
+        "RAM, at most 32 GiB; explicit values may use free RAM minus 4 GiB)",
+        "Cache", &cache_ram_bytes);
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
@@ -1402,7 +1442,9 @@ int RunServe(std::span<const char* const> args) {
                            .staging_capacity_bytes = cache_disk_staging_bytes,
                            .model_artifact_fingerprint = {},
                        },
-                       vision_model_path)) {
+                       vision_model_path,
+                       server::TextRunnerRamCacheOptions{
+                           .capacity_bytes = cache_ram_bytes})) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
@@ -1462,12 +1504,19 @@ int RunServe(std::span<const char* const> args) {
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
   }
 
+  // run() joins every request thread, so no hook call outlives it.
+  std::atomic<bool> device_lost{false};
   server::HttpServer server(
       host, port, backend, video_jobs, tts, asr,
       server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
           .api_key = std::move(api_key),
+          .on_device_lost =
+              [&device_lost] {
+                device_lost.store(true);
+                ShutdownAfterDeviceLoss();
+              },
       },
       images);
   std::string err;
@@ -1475,7 +1524,21 @@ int RunServe(std::span<const char* const> args) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
     return 1;
   }
-  server.run(/*handle_signals=*/true);
+  // Releasing model state on a lost device crashes; the kernel reclaims it.
+  // The backend is checked as well: an external SIGTERM can stop the server
+  // after the scheduler records the loss but before a request fires the hook.
+  const auto exit_if_device_lost = [&device_lost, &backend] {
+    if (device_lost.load() || (backend != nullptr && backend->device_lost())) {
+      ::_exit(kDeviceLostExitStatus);
+    }
+  };
+  try {
+    server.run(/*handle_signals=*/true);
+  } catch (...) {
+    exit_if_device_lost();
+    throw;
+  }
+  exit_if_device_lost();
   return 0;
 }
 

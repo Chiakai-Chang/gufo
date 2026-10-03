@@ -29,7 +29,12 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kOutputBackpressure,
   kSchedulerStopping,
   kToolChoiceUnsatisfied,
+  kDeviceLost,
 };
+
+/// Client-facing message for a GPU context that can no longer execute work.
+inline constexpr const char* kDeviceLostMessage =
+    "GPU context lost; restart required";
 
 class TextGenerationError final : public std::runtime_error {
 public:
@@ -47,6 +52,7 @@ public:
       case TextGenerationErrorCode::kOutputLimit:
       case TextGenerationErrorCode::kOutputBackpressure:
       case TextGenerationErrorCode::kSchedulerStopping:
+      case TextGenerationErrorCode::kDeviceLost:
         return 503;
       case TextGenerationErrorCode::kToolChoiceUnsatisfied:
         return 502;
@@ -69,12 +75,15 @@ public:
         return "scheduler_stopping";
       case TextGenerationErrorCode::kToolChoiceUnsatisfied:
         return "tool_choice_unsatisfied";
+      case TextGenerationErrorCode::kDeviceLost:
+        return "device_lost";
     }
     return "generation_error";
   }
   [[nodiscard]] bool retryable() const noexcept {
     return code_ != TextGenerationErrorCode::kOutputLimit &&
-           code_ != TextGenerationErrorCode::kToolChoiceUnsatisfied;
+           code_ != TextGenerationErrorCode::kToolChoiceUnsatisfied &&
+           code_ != TextGenerationErrorCode::kDeviceLost;
   }
 
 private:
@@ -131,6 +140,20 @@ public:
     std::int64_t time_ms{0};
   };
   using ProgressCallback = std::function<bool(const PromptProgress&)>;
+
+  /// One execution session for llama-server `/slots`. Idle sessions report
+  /// zero counts rather than the previous request's.
+  struct SessionState {
+    bool processing{false};
+    bool speculative{false};
+    std::uint64_t request_id{0};
+    std::size_t prompt_tokens{0};
+    std::size_t cached_prompt_tokens{0};
+    /// Prompt tokens prefilled so far, excluding cached tokens.
+    std::size_t processed_prompt_tokens{0};
+    std::size_t generated_tokens{0};
+    std::size_t remaining_tokens{0};
+  };
 
   enum class FinishReason : std::uint8_t {
     kStop,
@@ -191,6 +214,9 @@ public:
     std::size_t physical_execution_width{1};
     std::size_t max_buffered_output_bytes{0};
     double queue_ms{0.0};
+    /// Part of queue_ms spent waiting for a concurrent request to publish
+    /// the prompt prefix both share.
+    double shared_prefix_wait_ms{0.0};
     double cache_restore_ms{0.0};
     double cache_snapshot_ms{0.0};
     double cache_disk_enqueue_ms{0.0};
@@ -212,7 +238,7 @@ public:
     bool cache_hit{false};
     bool cache_disk_hit{false};
     bool cancelled{false};
-    /// Internal: token totals were already recorded during execution.
+    /// Internal: the scheduler recorded this request's `/metrics` counters.
     bool token_metrics_recorded{false};
   };
 
@@ -246,9 +272,16 @@ public:
   [[nodiscard]] virtual std::uint32_t context_tokens() const { return 0; }
   [[nodiscard]] virtual std::size_t session_count() const { return 1; }
   [[nodiscard]] virtual bool has_vision() const { return false; }
+  /// True once a failed generation showed that the execution device can no
+  /// longer run work, for example after a GPU reset. The loss is permanent.
+  [[nodiscard]] virtual bool device_lost() const { return false; }
   /// Maximum tokens accepted by the loaded model under the configured context.
   /// Zero when no text model is loaded.
   [[nodiscard]] virtual std::uint32_t max_context() const { return 0; }
+  /// Live execution sessions; empty when the backend has no session pool.
+  [[nodiscard]] virtual std::vector<SessionState> session_states() const {
+    return {};
+  }
   /// Whether the loaded backend accepts image inputs in chat requests.
   [[nodiscard]] virtual bool supports_images() const { return false; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {

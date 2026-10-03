@@ -17,17 +17,11 @@
 
 namespace gufo::server {
 
-/// Ordinary host allocations use the host budget, not HIP's device capacity.
-std::size_t HostSnapshotBudgetBytes() {
-  // GUFO_SNAPSHOT_BUDGET_MIB fixes the retained host snapshot pool. Without it
-  // the pool is half the memory available at load, which varies run to run;
-  // a single snapshot larger than the pool is never retained.
-  if (const char* fixed = std::getenv("GUFO_SNAPSHOT_BUDGET_MIB"); fixed && *fixed) {
-    char* end = nullptr;
-    const unsigned long long mib = std::strtoull(fixed, &end, 10);
-    if (end != fixed && *end == 0 && mib > 0)
-      return static_cast<std::size_t>(mib) << 20;
-  }
+namespace {
+
+/// Host RAM still available, after cgroup limits. Unified-memory device
+/// allocations draw from the same RAM, so HIP's device capacity is not used.
+std::uint64_t HostAvailableBytes() {
   const long pages = sysconf(_SC_AVPHYS_PAGES);
   const long page_size = sysconf(_SC_PAGESIZE);
   if (pages <= 0 || page_size <= 0)
@@ -65,8 +59,34 @@ std::size_t HostSnapshotBudgetBytes() {
     }
     break;
   }
-  return static_cast<std::size_t>(std::min<std::uint64_t>(
-      available / 2, std::numeric_limits<std::size_t>::max()));
+  return available;
+}
+
+std::size_t ClampToSize(std::uint64_t bytes) {
+  return static_cast<std::size_t>(
+      std::min<std::uint64_t>(bytes, std::numeric_limits<std::size_t>::max()));
+}
+
+}  // namespace
+
+std::size_t HostSnapshotBudgetBytes() {
+  // GUFO_SNAPSHOT_BUDGET_MIB fixes the retained host snapshot pool. Without it
+  // the pool is half the memory available at load, which varies run to run;
+  // a single snapshot larger than the pool is never retained.
+  if (const char* fixed = std::getenv("GUFO_SNAPSHOT_BUDGET_MIB"); fixed && *fixed) {
+    char* end = nullptr;
+    const unsigned long long mib = std::strtoull(fixed, &end, 10);
+    if (end != fixed && *end == 0 && mib > 0)
+      return static_cast<std::size_t>(mib) << 20;
+  }
+  return ClampToSize(HostAvailableBytes() / 2);
+}
+
+std::size_t HostSnapshotCeilingBytes() {
+  const auto available = HostAvailableBytes();
+  return ClampToSize(available > kHostSnapshotHeadroomBytes
+                         ? available - kHostSnapshotHeadroomBytes
+                         : 0);
 }
 
 namespace {
@@ -76,6 +96,8 @@ struct ValidatedRunner {
   TextRunnerDescriptor descriptor;
   TextRunnerResourceClaim resources;
   std::vector<TextExecutionPlan> plans;
+  std::size_t snapshot_automatic_bytes{0};
+  std::size_t snapshot_max_bytes{0};
 };
 
 std::optional<std::size_t> PerStateReservationBytes(
@@ -288,6 +310,8 @@ std::string_view DiskEventReasonName(
       return "staging_capacity";
     case ContinuationDiskEventReason::kLru:
       return "lru";
+    case ContinuationDiskEventReason::kMinStep:
+      return "min_step";
     case ContinuationDiskEventReason::kExactReplacement:
       return "exact_replacement";
     case ContinuationDiskEventReason::kCorrupt:
@@ -336,10 +360,12 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
     if (event.reason == ContinuationDiskEventReason::kSaved) {
       line << " write_ms=" << event.elapsed_ms;
       Logger::Info("cache", line.str());
-    } else if (event.reason == ContinuationDiskEventReason::kLru) {
-      // Staying inside a configured budget is expected operation, but it has
-      // to be visible: otherwise a run that evicts every other conversation
-      // looks identical to one that never cached anything.
+    } else if (event.reason == ContinuationDiskEventReason::kLru ||
+               event.reason == ContinuationDiskEventReason::kMinStep) {
+      // Staying inside a configured budget or skipping a checkpoint that
+      // barely advances is expected operation, but it has to be visible:
+      // otherwise a run that evicts every other conversation looks identical
+      // to one that never cached anything.
       Logger::Info("cache", line.str());
     } else {
       Logger::Warn("cache", line.str());
@@ -350,7 +376,7 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
 }
 
 ContinuationCache::SnapshotSupport MakeSnapshotSupport(
-    ValidatedRunner* validated) {
+    ValidatedRunner* validated, TextRunnerRamCacheOptions options) {
   if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
       !validated->descriptor.capabilities.fork) {
     return {};
@@ -370,9 +396,20 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
             ReconcileStateBytes(validated->resources, text_state);
           },
       .capacity_bytes =
-          [validated] {
+          [validated, options] {
             const auto resources = validated->runner->ResourceClaim();
-            return resources.retained_snapshot_capacity_bytes.value_or(0);
+            const auto automatic =
+                resources.retained_snapshot_capacity_bytes.value_or(0);
+            validated->snapshot_automatic_bytes = std::min(
+                TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
+            validated->snapshot_max_bytes =
+                resources.retained_snapshot_ceiling_bytes.value_or(automatic);
+            if (options.capacity_bytes == 0)
+              return validated->snapshot_automatic_bytes;
+            // An explicit limit is the operator's choice to trade headroom
+            // for retention, bounded so the host keeps a fixed reserve.
+            return std::min(options.capacity_bytes,
+                            validated->snapshot_max_bytes);
           },
       .on_event = EmitSnapshotEvent,
   };
@@ -464,8 +501,10 @@ void TextModelRunner::RestorePersistentSnapshot(
 }
 
 struct TextRunnerPool::Impl {
+  static constexpr std::size_t kIntermediateCheckpoints = 4;
   Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count,
-       std::optional<TextRunnerDiskCacheOptions> disk_cache_options)
+       std::optional<TextRunnerDiskCacheOptions> disk_cache_options,
+       TextRunnerRamCacheOptions ram_cache_options)
       : validated(ValidateRunner(std::move(model_runner), state_count)),
         cache(
             state_count,
@@ -478,18 +517,20 @@ struct TextRunnerPool::Impl {
               ReconcileStateBytes(validated.resources, *state);
               return state;
             },
-            MakeSnapshotSupport(&validated),
-            state_count <= std::numeric_limits<std::size_t>::max() / 2
-                ? state_count * 2
-                : state_count) {
+            MakeSnapshotSupport(&validated, ram_cache_options),
+            TextRunnerRamCacheOptions::kMaxEntries) {
     // Entry and byte limits constrain retention independently of session count.
     if (validated.descriptor.capabilities.snapshot) {
-      Logger::Info("cache",
-                   "event=snapshot_cache_configured sessions=" +
-                       std::to_string(state_count) + " snapshot_entries=" +
-                       std::to_string(cache.entry_capacity()) +
-                       " capacity_bytes=" +
-                       std::to_string(cache.snapshot_capacity_bytes()));
+      // Report the same post-allocation limits that selected the capacity.
+      Logger::Info(
+          "cache",
+          "event=snapshot_cache_configured sessions=" +
+              std::to_string(state_count) + " snapshot_entries=" +
+              std::to_string(cache.entry_capacity()) + " capacity_bytes=" +
+              std::to_string(cache.snapshot_capacity_bytes()) +
+              " automatic_bytes=" +
+              std::to_string(validated.snapshot_automatic_bytes) +
+              " max_bytes=" + std::to_string(validated.snapshot_max_bytes));
     }
     if (disk_cache_options.has_value()) {
       if (!validated.descriptor.persistence.has_value()) {
@@ -502,6 +543,8 @@ struct TextRunnerPool::Impl {
               .capacity_bytes = disk_cache_options->capacity_bytes,
               .staging_capacity_bytes =
                   disk_cache_options->staging_capacity_bytes,
+              .min_checkpoint_step_tokens =
+                  disk_cache_options->min_checkpoint_step_tokens,
           },
           EmitDiskEvent);
       Logger::Info("cache",
@@ -586,7 +629,7 @@ struct TextRunnerPool::Request::Impl {
        std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
        std::shared_ptr<const TextPromptContext> prompt_context,
-       std::size_t cache_prefix_tokens)
+       std::size_t cache_prefix_tokens, bool overlap_snapshots)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
@@ -596,10 +639,11 @@ struct TextRunnerPool::Request::Impl {
         decode_ready(prefill_offset == prompt.size()),
         sampler(sampling_config, prompt),
         context(std::move(prompt_context)),
-        retain_fallback(cache_prefix_tokens != 0) {
+        retain_fallback(cache_prefix_tokens != 0),
+        overlap_snapshots(overlap_snapshots) {
     // On a warm continuation the reused frontier is already a safe fallback.
-    // Freeze it before prefill, then process the entire new suffix together.
-    // Cold requests still checkpoint before mutable assistant framing.
+    // Freeze it before prefill, then retain this turn's own stable boundary
+    // before mutable assistant framing.
     auto count = cache_prefix_tokens == 0 ? prompt.size() : cache_prefix_tokens;
     // A newly consumed image needs its own stable checkpoint. Otherwise the
     // next assistant turn can invalidate the complete prompt's framing and
@@ -608,8 +652,16 @@ struct TextRunnerPool::Request::Impl {
         context && !std::ranges::equal(context->CacheIdentity(prefill_offset),
                                        context->CacheIdentity(count));
     if (retain_fallback && lease.cache_hit() && prefill_offset <= count &&
-        !new_images)
+        !new_images) {
+      // Freezing the reused frontier must not cost this turn its own stable
+      // boundary. A client that rewrites the assistant turn, as one dropping
+      // reasoning does, diverges after that boundary, so retaining only the
+      // frontier pins every later turn to the same early position and the
+      // re-prefilled tail grows for the rest of the conversation.
+      if (prefill_offset < count)
+        stable_prefix_position = count;
       count = prefill_offset;
+    }
     if (lease.restored_from_disk() && prefill_offset == prompt.size())
       count = prompt.size();
     snapshot_tokens.reserve(prompt.size());
@@ -623,6 +675,27 @@ struct TextRunnerPool::Request::Impl {
           state,
           std::span<const TextRunnerToken>(prompt).first(prefill_offset));
     }
+    const auto capabilities = runner->Descriptor().capabilities;
+    if (capabilities.incremental_prefill && capabilities.prefix_reuse &&
+        capabilities.snapshot && capabilities.fork) {
+      // A reused frontier already bounds the work lost on an edit. Do not
+      // split a short continuation just to copy a nearby grid checkpoint.
+      // Cold long prompts still retain the last grid point for late edits.
+      constexpr std::size_t interval = 2048;
+      const auto grid_points = (prompt.size() - 1) / interval;
+      const auto count =
+          std::min(grid_points, TextRunnerPool::Impl::kIntermediateCheckpoints);
+      for (std::size_t point = 1; point <= count; ++point) {
+        const auto position = grid_points * point / count * interval;
+        if (position > prefill_offset &&
+            position - prefill_offset >= interval &&
+            position != snapshot_tokens.size() &&
+            position != stable_prefix_position &&
+            !lease.HasSnapshotFor(
+                std::span<const TextRunnerToken>(prompt).first(position)))
+          checkpoints.push_back(position);
+      }
+    }
   }
 
   ~Impl() {
@@ -633,13 +706,19 @@ struct TextRunnerPool::Request::Impl {
   }
 
   void CapturePromptSnapshot(bool wait = true) noexcept {
+    if (boundary_capture) {
+      if (!wait && snapshot_future.wait_for(std::chrono::seconds(0)) !=
+                       std::future_status::ready)
+        return;
+      FinishSnapshot();
+    }
     if (!prompt_snapshot_attempted)
       StartPromptSnapshot(wait);
     if (snapshot_future.valid()) {
       if (!wait && snapshot_future.wait_for(std::chrono::seconds(0)) !=
                        std::future_status::ready)
         return;
-      FinishPromptSnapshot();
+      FinishSnapshot();
     }
     if (prompt_snapshot_attempted && prefill_offset == snapshot_tokens.size() &&
         snapshot_tokens.size() < prompt.size()) {
@@ -648,8 +727,9 @@ struct TextRunnerPool::Request::Impl {
       // Admission may refuse it without discarding the fallback.
       if (prompt_snapshot && retain_snapshot) {
         try {
-          snapshot_metrics.snapshot_bytes += lease.PublishSnapshot(
-              snapshot_tokens, std::move(prompt_snapshot));
+          snapshot_metrics.snapshot_bytes +=
+              lease.PublishSnapshot(snapshot_tokens, std::move(prompt_snapshot),
+                                    fallback_position != 0);
         } catch (...) {
           lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
                              snapshot_bytes, snapshot_tokens.size());
@@ -658,7 +738,17 @@ struct TextRunnerPool::Request::Impl {
       prompt_snapshot.reset();
       retain_snapshot = false;
       fallback_position = snapshot_tokens.size();
-      snapshot_tokens = prompt;
+      // Take this turn's stable boundary next, before the complete prompt.
+      // The boundary is a prefix of whatever the client sends next, while the
+      // complete prompt ends in assistant framing the client may rewrite.
+      if (stable_prefix_position > snapshot_tokens.size() &&
+          stable_prefix_position < prompt.size()) {
+        snapshot_tokens.assign(prompt.begin(),
+                               prompt.begin() + stable_prefix_position);
+        stable_prefix_position = 0;
+      } else {
+        snapshot_tokens = prompt;
+      }
       prompt_snapshot_attempted = false;
     }
   }
@@ -708,13 +798,25 @@ struct TextRunnerPool::Request::Impl {
     retain_snapshot = false;
     try {
       retain_snapshot = lease.TryReserveSnapshot(
-          snapshot_bytes, snapshot_tokens.size(), retain_fallback);
+          snapshot_bytes, snapshot_tokens.size(),
+          retain_fallback && (fallback_position == 0 ||
+                              snapshot_tokens.size() == prompt.size()),
+          retain_fallback && snapshot_tokens.size() == prompt.size()
+              ? SnapshotPurpose::kRetry
+              : SnapshotPurpose::kContinuation,
+          snapshot_tokens);
     } catch (...) {
       return;
     }
     if (!retain_snapshot) {
       try {
         if (!disk_store)
+          return;
+        // Copying device state only for disk is costly on the request path.
+        // Skip it when the disk store would discard the checkpoint anyway.
+        if (disk_store->WithinCheckpointStep(
+                *runner, snapshot_tokens,
+                InputIdentity(snapshot_tokens.size())))
           return;
         disk_capture = disk_store->ReserveCapture(
             *runner, snapshot_tokens.size(), snapshot_bytes,
@@ -792,60 +894,106 @@ struct TextRunnerPool::Request::Impl {
       prompt_snapshot.reset();
   }
 
-  /// Persists the continuation at a shared-prefix boundary reached by prefill.
-  ///
-  /// The boundary was learned from stored entries that agree with this prompt
-  /// up to `position`, so the next conversation sharing that prefix restores
-  /// it instead of prefilling it again. The bounded worker persists the
-  /// immutable snapshot without blocking other requests on disk I/O.
-  void CaptureSharedPrefix(std::size_t position) noexcept {
-    if (disk_store == nullptr || position == 0 || position >= prompt.size()) {
+  void FinishSnapshot() noexcept {
+    if (!boundary_capture) {
+      FinishPromptSnapshot();
       return;
     }
-    const auto start = std::chrono::steady_clock::now();
+    try {
+      (void)snapshot_future.get();
+    } catch (...) {
+      // The boundary worker handles failed capture/admission internally.
+    }
+    boundary_capture = false;
+  }
+
+  void CaptureBoundarySnapshot(
+      std::size_t position, bool history, bool shared,
+      SnapshotPurpose purpose = SnapshotPurpose::kHistory) noexcept {
+    if (!overlap_snapshots) {
+      // A single execution slot has no peer work to overlap with the copy.
+      CaptureBoundarySnapshotNow(position, history, shared, purpose);
+      return;
+    }
+    // The scheduler already parks leases with a pending snapshot. Reuse that
+    // path so allocation, eviction and copying do not stall unrelated users.
+    // Direct callers and cancellation join before touching this lease again.
+    try {
+      snapshot_future = std::async(
+          std::launch::async, [this, position, history, shared, purpose] {
+            CaptureBoundarySnapshotNow(position, history, shared, purpose);
+            return std::unique_ptr<TextRunnerSnapshot>{};
+          });
+      boundary_capture = true;
+    } catch (...) {
+      // Optional caching must not fail the request if a worker cannot start.
+    }
+  }
+
+  void CaptureBoundarySnapshotNow(
+      std::size_t position, bool history, bool shared,
+      SnapshotPurpose purpose = SnapshotPurpose::kHistory) noexcept {
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t bytes = 0;
+    bool reserved = false;
     bool failed = false;
     try {
       const auto capabilities = runner->Descriptor().capabilities;
       if (!capabilities.prefix_reuse || !capabilities.snapshot ||
-          !capabilities.fork) {
+          !capabilities.fork)
         return;
-      }
       const auto& state = dynamic_cast<const TextRunnerState&>(lease.state());
-      if (runner->CheckpointPosition(state) != position) {
+      if (runner->CheckpointPosition(state) != position)
         return;
-      }
       const auto prefix =
           std::span<const TextRunnerToken>(prompt).first(position);
       const auto identity = InputIdentity(position);
-      // Another request may have stored this prefix meanwhile.
-      if (disk_store->Touch(*runner, prefix, identity)) {
-        return;
-      }
-      if (!disk_store->CanSave(*runner, position,
-                               runner->SnapshotPayloadBytes(state), identity))
+      bytes = runner->SnapshotPayloadBytes(state);
+      // Intermediate copies must not displace the frontier this request
+      // branched from, including its stable image/reasoning fallback.
+      // Copies other requests depend on compete like continuation
+      // boundaries; the rest give way under pressure.
+      if (history && !lease.HasSnapshotFor(prefix))
+        reserved = lease.TryReserveSnapshot(bytes, position, true, purpose);
+      std::unique_ptr<ContinuationDiskStore::CaptureReservation> persistence;
+      if (shared && disk_store && !disk_store->Touch(*runner, prefix, identity))
+        persistence =
+            disk_store->ReserveCapture(*runner, position, bytes, identity);
+      if (!reserved && !persistence)
         return;
       std::shared_ptr<const TextRunnerSnapshot> snapshot =
           runner->Snapshot(state);
-      if (snapshot == nullptr) {
-        return;
+      failed = !snapshot;
+      if (snapshot && reserved) {
+        snapshot_metrics.snapshot_bytes += lease.PublishSnapshot(
+            {prefix.begin(), prefix.end()}, snapshot, true);
+        reserved = false;
       }
-      const auto saved = disk_store->SaveAsync(
-          runner, {prefix.begin(), prefix.end()}, std::move(snapshot),
-          {identity.begin(), identity.end()});
-      if (saved != 0) {
-        ++snapshot_metrics.shared_prefix_snapshots;
-        snapshot_metrics.shared_prefix_bytes += saved;
+      // A RAM checkpoint and a learned disk boundary can coincide. Share the
+      // immutable copy instead of reading the same device state twice.
+      if (snapshot && persistence) {
+        const auto saved = disk_store->SaveAsync(
+            runner, {prefix.begin(), prefix.end()}, std::move(snapshot),
+            {identity.begin(), identity.end()}, std::move(persistence),
+            /*shared_prefix=*/true);
+        if (saved != 0) {
+          ++snapshot_metrics.shared_prefix_snapshots;
+          snapshot_metrics.shared_prefix_bytes += saved;
+        }
       }
     } catch (...) {
-      // Best effort: the request itself is unaffected.
       failed = true;
     }
-    snapshot_metrics.shared_prefix_ms +=
-        std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - start)
-            .count();
-    if (failed) {
-      snapshot_metrics.shared_prefix_failures += 1;
+    if (reserved)
+      lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, bytes, position);
+    const auto elapsed = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    if (history)
+      snapshot_metrics.snapshot_ms += elapsed;
+    if (shared) {
+      snapshot_metrics.shared_prefix_ms += elapsed;
+      snapshot_metrics.shared_prefix_failures += failed;
     }
   }
 
@@ -856,6 +1004,11 @@ struct TextRunnerPool::Request::Impl {
   std::vector<TextRunnerToken> snapshot_tokens;
   /// Ascending prefill positions to persist, all inside (cached, prompt size).
   std::vector<std::size_t> boundaries;
+  /// Bounded intermediate positions retained in RAM before state advances.
+  std::vector<std::size_t> checkpoints;
+  /// Checkpoints shared with other requests, retained like continuations.
+  std::vector<std::size_t> shared_checkpoints;
+  bool boundary_capture{false};
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
@@ -867,7 +1020,12 @@ struct TextRunnerPool::Request::Impl {
   sampling::SamplerState sampler;
   std::shared_ptr<const TextPromptContext> context;
   bool retain_fallback{false};
+  bool overlap_snapshots{false};
   std::size_t fallback_position{0};
+  /// This turn's stable boundary when the reused frontier sits before it, so
+  /// the boundary is checkpointed after the frozen fallback instead of being
+  /// skipped. Zero once taken, or when the two positions coincide.
+  std::size_t stable_prefix_position{0};
   [[nodiscard]] std::span<const std::uint8_t> InputIdentity(
       std::size_t token_count) const {
     return context ? context->CacheIdentity(token_count)
@@ -958,6 +1116,60 @@ bool TextRunnerPool::Request::prefill_complete() const noexcept {
   return impl_ != nullptr && impl_->decode_ready;
 }
 
+std::span<const TextRunnerToken> TextRunnerPool::Request::prompt()
+    const noexcept {
+  return impl_ != nullptr ? std::span<const TextRunnerToken>(impl_->prompt)
+                          : std::span<const TextRunnerToken>{};
+}
+
+std::size_t TextRunnerPool::Request::prefill_position() const noexcept {
+  return impl_ != nullptr ? impl_->prefill_offset : 0;
+}
+
+std::span<const std::uint8_t> TextRunnerPool::Request::input_identity(
+    std::size_t token_count) const {
+  return impl_ != nullptr ? impl_->InputIdentity(token_count)
+                          : std::span<const std::uint8_t>{};
+}
+
+std::size_t TextRunnerPool::Request::ShareCheckpoint(
+    std::size_t common_tokens) {
+  if (!*this || impl_->decode_ready || impl_->stopped)
+    return 0;
+  const auto capabilities = impl_->runner->Descriptor().capabilities;
+  if (!capabilities.incremental_prefill || !capabilities.prefix_reuse ||
+      !capabilities.snapshot || !capabilities.fork)
+    return 0;
+  // The complete prompt is retained only after decoding starts; share the
+  // last prefill position instead so peers can start sooner.
+  const auto target = std::min(common_tokens, impl_->prompt.size() - 1);
+  const auto offset = impl_->prefill_offset;
+  if (target <= offset)
+    return 0;
+  // Prefill already publishes the fallback, this turn's stable boundary and
+  // intermediate checkpoints before advancing past them.
+  std::size_t planned = 0;
+  const auto consider = [&](std::size_t position) {
+    if (position > offset && position <= target && position > planned)
+      planned = position;
+  };
+  if (impl_->snapshot_tokens.size() < impl_->prompt.size())
+    consider(impl_->snapshot_tokens.size());
+  consider(impl_->stable_prefix_position);
+  for (const auto position : impl_->checkpoints)
+    consider(position);
+  auto& checkpoints = impl_->checkpoints;
+  const auto position =
+      planned != 0 && target - planned <= kSharedCheckpointSlack ? planned
+                                                                 : target;
+  if (position == target && !std::ranges::binary_search(checkpoints, target))
+    checkpoints.insert(std::ranges::upper_bound(checkpoints, target), target);
+  // Prompt snapshots are retained as continuation boundaries already.
+  if (std::ranges::binary_search(checkpoints, position))
+    impl_->shared_checkpoints.push_back(position);
+  return position;
+}
+
 void TextRunnerPool::Request::PrepareBatchExecution() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
@@ -1003,15 +1215,26 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     max_input_tokens = std::min(
         max_input_tokens, impl_->boundaries.front() - impl_->prefill_offset);
   }
+  while (!impl_->checkpoints.empty() &&
+         impl_->checkpoints.front() <= impl_->prefill_offset)
+    impl_->checkpoints.erase(impl_->checkpoints.begin());
+  if (!impl_->checkpoints.empty())
+    max_input_tokens = std::min(
+        max_input_tokens, impl_->checkpoints.front() - impl_->prefill_offset);
 
   const std::size_t remaining = impl_->prompt.size() - impl_->prefill_offset;
   impl_->state_reusable = false;
   // Complete the model frontier at the cache boundary, including logits and
   // draft catch-up. Its snapshot can then be restored independently.
-  const auto model_prompt = std::span<const TextRunnerToken>(impl_->prompt)
-                                .first(impl_->prefill_offset < snapshot_position
-                                           ? snapshot_position
-                                           : impl_->prompt.size());
+  auto frontier = impl_->prefill_offset < snapshot_position
+                      ? snapshot_position
+                      : impl_->prompt.size();
+  if (!impl_->checkpoints.empty())
+    frontier = std::min(frontier, impl_->checkpoints.front());
+  if (!impl_->boundaries.empty())
+    frontier = std::min(frontier, impl_->boundaries.front());
+  const auto model_prompt =
+      std::span<const TextRunnerToken>(impl_->prompt).first(frontier);
   auto step = impl_->runner->Prefill(
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), model_prompt,
       impl_->prefill_offset, max_input_tokens);
@@ -1032,11 +1255,25 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   impl_->state_reusable = true;
   if (!reached_frontier && impl_->prefill_offset == snapshot_position)
     impl_->CapturePromptSnapshot(false);
-  if (!impl_->boundaries.empty() &&
-      impl_->boundaries.front() == impl_->prefill_offset) {
+  const bool history = !impl_->checkpoints.empty() &&
+                       impl_->checkpoints.front() == impl_->prefill_offset;
+  const bool shared = !impl_->boundaries.empty() &&
+                      impl_->boundaries.front() == impl_->prefill_offset;
+  if (history)
+    impl_->checkpoints.erase(impl_->checkpoints.begin());
+  if (shared)
     impl_->boundaries.erase(impl_->boundaries.begin());
-    impl_->CaptureSharedPrefix(impl_->prefill_offset);
-  }
+  // A prompt/fallback capture also persists this boundary. Do not start a
+  // second worker over the same state or replace its pending result.
+  const bool shared_with_peers =
+      history &&
+      std::ranges::find(impl_->shared_checkpoints, impl_->prefill_offset) !=
+          impl_->shared_checkpoints.end();
+  if ((history || shared) && impl_->prefill_offset != snapshot_position)
+    impl_->CaptureBoundarySnapshot(impl_->prefill_offset, history, shared,
+                                   shared_with_peers
+                                       ? SnapshotPurpose::kContinuation
+                                       : SnapshotPurpose::kHistory);
   return step;
 }
 
@@ -1187,7 +1424,7 @@ TextRunnerPool::Request::Cancel() noexcept {
     // Join only an existing capture; cancellation must not start a new copy
     // or execute the pending selected token merely to retain the session.
     if (impl_->snapshot_future.valid())
-      impl_->FinishPromptSnapshot();
+      impl_->FinishSnapshot();
     auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
     state.SetCancellationCheck({});
     const auto capabilities = impl_->runner->Descriptor().capabilities;
@@ -1245,9 +1482,10 @@ void TextRunnerPool::Request::Invalidate() noexcept {
 
 TextRunnerPool::TextRunnerPool(
     std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
-    std::optional<TextRunnerDiskCacheOptions> disk_cache)
+    std::optional<TextRunnerDiskCacheOptions> disk_cache,
+    TextRunnerRamCacheOptions ram_cache)
     : impl_(std::make_unique<Impl>(std::move(runner), state_count,
-                                   std::move(disk_cache))) {}
+                                   std::move(disk_cache), ram_cache)) {}
 
 TextRunnerPool::~TextRunnerPool() = default;
 
@@ -1569,16 +1807,48 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       return boundary <= lease.cached_tokens();
     });
   }
-  return Request(std::make_unique<Request::Impl>(
+  Request request(std::make_unique<Request::Impl>(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
       std::move(prompt), std::move(boundaries), sampling_config,
-      std::move(context), cache_prefix_tokens));
+      std::move(context), cache_prefix_tokens, impl_->cache.capacity() > 1));
+  // Prompts that diverge from a retained one after a long common prefix,
+  // such as new conversations under one system prompt, publish a checkpoint
+  // at the divergence point. Later prompts sharing it restore it exactly
+  // instead of the nearest grid checkpoint. A divergence in the last few
+  // tokens, such as an edited final message, is already covered by this
+  // request's own stable checkpoint; another copy would only take its RAM.
+  if (reuse_prompt) {
+    const auto shared = impl_->cache.CommonPrefixTokens(
+        request.prompt(), identity, input_prefixes);
+    if (shared >=
+            request.prefill_position() + Request::kSharedPrefixMinTokens &&
+        shared + Request::kSharedCheckpointSlack < request.prompt_tokens()) {
+      const auto position = request.ShareCheckpoint(shared);
+      if (position != 0 && Logger::Enabled(LogLevel::kDebug)) {
+        std::ostringstream line;
+        line << "event=shared_prefix_learned tokens=" << position
+             << " cached=" << request.prefill_position()
+             << " prompt_tokens=" << request.prompt_tokens();
+        Logger::Debug("cache", line.str());
+      }
+    }
+  }
+  return request;
 }
 
 TextRunnerPool::Request TextRunnerPool::Acquire(
     std::vector<TextRunnerToken> prompt,
     const CancellationCheck& is_cancelled) {
   return Acquire(std::move(prompt), sampling::SamplingConfig{}, is_cancelled);
+}
+
+std::size_t TextRunnerPool::CachedPrefixTokens(
+    std::span<const TextRunnerToken> prompt,
+    const TextPromptContext* context) const {
+  if (context == nullptr)
+    return impl_->cache.CachedPrefixTokens(prompt);
+  return impl_->cache.CachedPrefixTokens(prompt, context->cache_identity,
+                                         context->cache_prefixes);
 }
 
 }  // namespace gufo::server
