@@ -1157,11 +1157,56 @@ void TestMinimumCheckpointStep() {
       "zero disables the step");
 }
 
+void TestEvictedWriteBackPrefersLongerSnapshots() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("evicted-store");
+  using Result = ContinuationDiskStore::EvictedSaveResult;
+  std::binary_semaphore entered(0), release(0);
+  bool first = true;
+  runner->before_stream = [&] {
+    if (std::exchange(first, false)) {
+      entered.release();
+      release.acquire();
+    }
+  };
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    Expect(store.SaveEvicted(runner, {1, 2}, MakeSnapshot(*runner, 1, 2)) ==
+               Result::kQueued,
+           "an idle store queues a write-back");
+    Expect(entered.try_acquire_for(std::chrono::seconds(2)),
+           "the first write-back starts");
+    Expect(store.SaveEvicted(runner, {3, 4}, MakeSnapshot(*runner, 2, 2)) ==
+               Result::kBusy,
+           "a snapshot no longer than the running one is skipped");
+    Expect(store.SaveEvicted(runner, {5, 5, 5}, MakeSnapshot(*runner, 3, 3)) ==
+               Result::kQueued,
+           "a longer snapshot waits behind a shorter running one");
+    Expect(store.SaveEvicted(runner, {6, 6}, MakeSnapshot(*runner, 4, 2)) ==
+               Result::kBusy,
+           "a shorter snapshot does not displace the waiting one");
+    Expect(store.SaveEvicted(runner, {7, 7, 7, 7},
+                             MakeSnapshot(*runner, 5, 4)) == Result::kReplaced,
+           "a longer snapshot replaces the waiting one");
+    release.release();
+  }
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  auto state = runner->CreateState();
+  Expect(RestoreTokens(restarted, *runner, *state, {1, 2, 9}).restored &&
+             RestoreTokens(restarted, *runner, *state, {7, 7, 7, 7, 9}).restored &&
+             RequireFakeState(*state).value == 5 &&
+             !RestoreTokens(restarted, *runner, *state, {5, 5, 5, 9}).restored &&
+             !RestoreTokens(restarted, *runner, *state, {3, 4, 9}).restored &&
+             restarted.entry_count() == 2,
+         "only the running and the longest waiting write-backs reach disk");
+}
+
 int main() {
   TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
   TestIndexedPrefixLookup();
   TestMinimumCheckpointStep();
+  TestEvictedWriteBackPrefersLongerSnapshots();
   TestImageIdentitySurvivesRestart();
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();

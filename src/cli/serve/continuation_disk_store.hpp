@@ -150,11 +150,14 @@ public:
       std::unique_ptr<CaptureReservation> reservation = {},
       bool shared_prefix = false);
 
+  enum class EvictedSaveResult { kQueued, kReplaced, kBusy };
+
   /// Writes back a snapshot the RAM pool just evicted. The snapshot already
-  /// lives in host memory, so the staging budget does not apply; at most one
-  /// such write is pending at a time and later ones are skipped meanwhile.
-  /// Returns false when the write was not queued.
-  bool SaveEvicted(std::shared_ptr<const TextModelRunner> runner,
+  /// lives in host memory, so the staging budget does not apply. At most one
+  /// such write runs and one waits; a longer snapshot replaces a shorter
+  /// waiting one or queues behind a shorter running one, otherwise it is
+  /// skipped (kBusy).
+  EvictedSaveResult SaveEvicted(std::shared_ptr<const TextModelRunner> runner,
                    std::vector<TextRunnerToken> checkpoint_tokens,
                    std::shared_ptr<const TextRunnerSnapshot> snapshot,
                    std::vector<std::uint8_t> input_identity = {});

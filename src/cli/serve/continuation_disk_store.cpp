@@ -590,6 +590,8 @@ struct ContinuationDiskStore::Impl {
           return;
         job = std::move(pending.front());
         pending.pop_front();
+        if (job.evicted)
+          evicted_writing_tokens = job.tokens.size();
       }
       try {
         (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity,
@@ -606,7 +608,7 @@ struct ContinuationDiskStore::Impl {
         std::lock_guard lock(queue_mutex);
         queued_bytes -= released;
         if (was_evicted)
-          evicted_pending = false;
+          evicted_writing_tokens = 0;
       }
       queue_changed.notify_all();
     }
@@ -1456,7 +1458,8 @@ struct ContinuationDiskStore::Impl {
   std::condition_variable queue_changed;
   std::deque<PendingSave> pending;
   std::size_t queued_bytes{0};
-  bool evicted_pending{false};
+  // Write-back keeps at most one evicted snapshot writing and one queued.
+  std::size_t evicted_writing_tokens{0};
   std::shared_ptr<std::atomic<std::size_t>> capture_bytes =
       std::make_shared<std::atomic<std::size_t>>(0);
   bool stopping{false};
@@ -1548,26 +1551,39 @@ std::size_t ContinuationDiskStore::SaveAsync(
   return file_bytes;
 }
 
-bool ContinuationDiskStore::SaveEvicted(
+ContinuationDiskStore::EvictedSaveResult ContinuationDiskStore::SaveEvicted(
     std::shared_ptr<const TextModelRunner> runner,
     std::vector<TextRunnerToken> checkpoint_tokens,
     std::shared_ptr<const TextRunnerSnapshot> snapshot,
     std::vector<std::uint8_t> input_identity) {
   if (!runner || !snapshot || checkpoint_tokens.empty())
-    return false;
+    return EvictedSaveResult::kBusy;
+  // Not charged to queued_bytes: the snapshot was already paid for by the
+  // RAM pool and must not block ordinary staged saves.
+  Impl::PendingSave job{std::move(runner), std::move(checkpoint_tokens),
+                        std::move(snapshot), std::move(input_identity),
+                        0, true, false};
+  Impl::PendingSave dropped;
   {
     std::lock_guard lock(impl_->queue_mutex);
-    if (impl_->stopping || impl_->evicted_pending)
-      return false;
-    impl_->evicted_pending = true;
-    // Not charged to queued_bytes: the snapshot was already paid for by the
-    // RAM pool and must not block ordinary staged saves.
-    impl_->pending.push_back({std::move(runner), std::move(checkpoint_tokens),
-                              std::move(snapshot), std::move(input_identity),
-                              0, true, false});
+    if (impl_->stopping)
+      return EvictedSaveResult::kBusy;
+    const auto queued =
+        std::ranges::find_if(impl_->pending, &Impl::PendingSave::evicted);
+    if (queued != impl_->pending.end()) {
+      // A longer history saves more prefill on restore than a short one.
+      if (job.tokens.size() <= queued->tokens.size())
+        return EvictedSaveResult::kBusy;
+      dropped = std::exchange(*queued, std::move(job));
+      return EvictedSaveResult::kReplaced;
+    }
+    if (impl_->evicted_writing_tokens != 0 &&
+        job.tokens.size() <= impl_->evicted_writing_tokens)
+      return EvictedSaveResult::kBusy;
+    impl_->pending.push_back(std::move(job));
   }
   impl_->queue_changed.notify_one();
-  return true;
+  return EvictedSaveResult::kQueued;
 }
 
 void ContinuationDiskStore::Flush() {

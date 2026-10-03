@@ -573,13 +573,17 @@ struct TextRunnerPool::Impl {
             if (!text_snapshot || !disk)
               return;
             const std::size_t token_count = tokens.size();
-            const bool queued = disk->SaveEvicted(
+            const auto result = disk->SaveEvicted(
                 runner, std::move(tokens), std::move(text_snapshot),
                 std::move(identity));
+            using Result = ContinuationDiskStore::EvictedSaveResult;
+            const char* action = result == Result::kQueued ? "action=queued"
+                                 : result == Result::kReplaced
+                                     ? "action=replaced_shorter"
+                                     : "action=skipped reason=busy";
             Logger::Info("cache", std::string("event=snapshot_writeback ") +
-                                      (queued ? "action=queued"
-                                              : "action=skipped reason=busy") +
-                                      " tokens=" + std::to_string(token_count));
+                                      action + " tokens=" +
+                                      std::to_string(token_count));
           });
     }
   }
