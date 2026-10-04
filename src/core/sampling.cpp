@@ -620,9 +620,11 @@ SamplingDistribution SamplerState::Distribution(
 std::optional<SamplingDistribution> SamplerState::DistributionFromTop(
     std::span<const float> values, std::span<const TokenId> ids,
     std::size_t vocab) const {
+  // A restrictive constraint can forbid every listed candidate, so constrained
+  // rows always take the full-row path, which applies the mask.
   if (values.size() != ids.size() || values.empty() ||
       config_.temperature == 0 || config_.top_k <= 0 ||
-      !penalty_counts_.empty()) {
+      !penalty_counts_.empty() || NeedsConstraintMask()) {
     return std::nullopt;
   }
   std::vector<Probability> candidates;

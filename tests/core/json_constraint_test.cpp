@@ -453,6 +453,19 @@ void TestTokensAndSampling() {
   assert(distribution.entries().size() == 1);
   assert(distribution.probability(1) == 1);
   assert(distribution.probability(4) == 0);
+  // A candidate list holding only forbidden tokens cannot stand in for the
+  // masked row, so constrained samplers defer to the full row.
+  {
+    const std::array<float, 2> top_values{101, 100};
+    const std::array<TokenId, 2> top_ids{10, 4};
+    SamplerState listed({.temperature = .5F, .top_k = 1, .seed = 42,
+                         .constraint = constraint});
+    listed.Accept(0);
+    assert(!listed.DistributionFromTop(top_values, top_ids, pieces.size()));
+    SamplerState unconstrained({.temperature = .5F, .top_k = 1, .seed = 42});
+    assert(unconstrained.DistributionFromTop(top_values, top_ids,
+                                             pieces.size()));
+  }
   const auto before = sampler;
   auto tentative = sampler;
   tentative.Accept(1);
