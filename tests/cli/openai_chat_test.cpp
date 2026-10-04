@@ -2650,9 +2650,17 @@ void TestJsonToolStringOwnership() {
       const auto* calls =
           output.find("choices")->items()[0].find("message")->find(
               "tool_calls");
+      // This fork keeps calls to tools outside the request (63736f4), so the
+      // undeclared envelope is returned as is, before the recovered call.
+      const std::size_t kept = rejected_shape == 0 ? 1 : 0;
       Expect(
-          calls && calls->size() == 1 &&
-              calls->items()[0].find("function")->member_str("arguments") ==
+          calls && calls->size() == kept + 1 &&
+              (kept == 0 ||
+               (calls->items()[0].find("function")->member_str("name") ==
+                    "undeclared" &&
+                calls->items()[0].find("function")->member_str("arguments") ==
+                    arguments.dump())) &&
+              calls->items()[kept].find("function")->member_str("arguments") ==
                   arguments.dump(),
           "rejected JSON envelopes cannot invoke quoted XML during recovery");
     }
