@@ -75,7 +75,7 @@ draft limit for this suite. Audio and image/video generation have separate tests
 | `image-inputs` | PNG, JPEG and WebP uploads in Chat and Responses; URL spellings, bad uploads and recovery |
 | `tools` | Required/named/auto, schemas, literal arguments and tool history |
 | `auto-tools` | Focused subset for optional tool calls |
-| `tool-edges` | Referenced argument types, literal CR, unusual keys and named Responses metadata |
+| `tool-edges` | Referenced argument types, literal CR, unusual keys, named Responses metadata and foreign tool markers in prose |
 | `tool-reasoning` | Quoted tags, literal edits, early stops and disabled tools across Chat/Responses |
 | `tool-agent` | Ordinary nested agent schemas, edit/read/finish turns, no protocol switch, limits, stops/retry, images and sampled peers |
 | `tool-agent-loop` | Bounded autonomous read/edit/verify loop; each turn checks cache reuse and detects repeated actions |
@@ -111,6 +111,9 @@ the runner removes that disk cache when the run ends, keeping reports and logs.
 For timing controls on revisions predating progress, use `--allow-missing-progress`
 with `--record-baseline`. Candidate qualification always requires progress events.
 Model runs stay outside hosted CI; CI checks the runner and measurement logic.
+The metrics suite reconciles verification-round counts with request timings and
+terminal logs, including cancelled requests; AR must report zero rounds and
+speculative modes must execute actual rounds.
 For metrics changes, run `--suite metrics` with AR and the affected speculative
 mode. It checks all three text endpoints and reconciles cancelled work with the
 terminal logs. It also checks both slot endpoints, active request identities and

@@ -197,6 +197,8 @@ public:
     std::size_t completion_tokens{0};
     /// Generated reasoning tokens, excluding the closing template delimiter.
     std::size_t reasoning_tokens{0};
+    /// Number of speculative verification rounds actually executed.
+    std::size_t draft_rounds{0};
     std::size_t draft_tokens{0};
     std::size_t draft_accepted_tokens{0};
     std::size_t lookup_tokens{0};
@@ -256,6 +258,13 @@ public:
     virtual Result Wait(const TokenCallback& on_token = {},
                         const ProgressCallback& on_progress = {}) = 0;
     virtual void Cancel() noexcept = 0;
+    /// Effective constrained tool format, including any schema fallback.
+    /// Available before Wait and stable for this admitted request. Backends
+    /// without this metadata retain the adapter's legacy format detection.
+    [[nodiscard]] virtual std::optional<sampling::JsonConstraint::ToolFormat>
+    ToolFormat() const {
+      return std::nullopt;
+    }
   };
 
   TextGenerationBackend() = default;
