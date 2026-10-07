@@ -125,9 +125,12 @@ public:
   Session& operator=(const Session&) = delete;
 
   /// Makes the session state equal to `prompt`: keeps the longest common
-  /// prefix with the current tokens, reprocesses the rest.
+  /// prefix with the current tokens, reprocesses the rest. `next` may name
+  /// the tokens the following Sync will append, so their n-gram rows can be
+  /// read during this one; it never changes the result.
   [[nodiscard]] bool Sync(std::span<const std::int32_t> prompt,
-                          std::string* error_msg = nullptr);
+                          std::string* error_msg = nullptr,
+                          std::span<const std::int32_t> next = {});
   /// Prefills through a stable text boundary in the same forward, returning
   /// a checkpoint of that boundary while the live session reaches prompt.
   [[nodiscard]] bool SyncThrough(std::span<const std::int32_t> prompt,
@@ -234,11 +237,13 @@ private:
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false, std::uint32_t boundary = 0,
             std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
-            double* capture_ms = nullptr);
+            double* capture_ms = nullptr,
+            std::span<const std::int32_t> after = {});
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
                 std::uint32_t boundary,
                 std::unique_ptr<SessionSnapshot>* checkpoint,
-                double* capture_ms = nullptr);
+                double* capture_ms = nullptr,
+                std::span<const std::int32_t> next = {});
   std::unique_ptr<SessionSnapshot> SaveSnapshotImpl(
       const rocm::Session& state, std::span<const std::int32_t> tokens,
       std::span<const float> logits, std::uint32_t hidden_rows,
