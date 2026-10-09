@@ -1,8 +1,9 @@
 # Cache redesign implementation cards
 
 Status: draft for review. Revised 2026-10-09 after the first review. Card 01's
-functional coverage is combined into one PR. Cards 02 and 03's common contracts,
-fake adapter and resource ledger are implemented; the cache redesign is not wired in.
+functional coverage is combined into one PR. Cards 02–04's common contracts,
+fake adapter, resource ledger and checkpoint ownership are implemented; the
+cache redesign is not wired in.
 
 These cards split the [RFC implementation plan](../RFC.md#implementation-plan)
 into isolated steps. Each PR card is meant to become one pull request, or a
@@ -47,7 +48,7 @@ Changed lines, excluding generated files: **S** ≤ 300 · **M** 300–1,000 ·
 | [01](01-functional-coverage.md) | Functional coverage for real cache workloads | Preparation | — | L (combined) | done |
 | [02](02-package-and-adapter-api.md) | `src/cache/` package, adapter API and fake adapter | Common package | — | L (contracts + fake) | done |
 | [03](03-resource-ledger.md) | Resource ledger and reservations | Common package | 02 | M | done |
-| [04](04-chunks-and-checkpoints.md) | Chunks, checkpoints and provenance | Common package | 03 | M–L | agreed |
+| [04](04-chunks-and-checkpoints.md) | Chunks, checkpoints and provenance | Common package | 03 | M–L | done |
 | [05](05-prefix-index-and-lookup.md) | Prefix index and lookup | Common package | 04 | M | agreed |
 | [06](06-slot-leases-and-mutation.md) | Slot leases and the mutation guard | Common package | 03, 04 | L | agreed |
 | [07](07-retention-policy.md) | Retention policy port | Common package | 05, 06 | M | agreed |
@@ -124,7 +125,9 @@ These come from the RFC, `AGENTS.md` and the review decisions; cards do not
 repeat them.
 
 - **Step baseline (D3):** each card records what it measured when it lands. It
-  is a reference point for card 20, not a target.
+  is a reference point for card 20, not a target. Keep important measurements,
+  their environment, commands and limitations in a **Results** section in the
+  relevant card. Do not add standalone measurement JSON files to the repository.
 - **Starting points, not file lists:** cards name types and areas to start
   from. The implementer chooses which files change.
 - **The current cache is untouched** until card 19 deletes it. Improvements to
