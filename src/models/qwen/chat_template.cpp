@@ -436,8 +436,23 @@ std::optional<std::string> QwenChatTemplate::Render(
     image_offsets->clear();
   if (content_spans != nullptr)
     content_spans->clear();
-  if (const auto* jinja = ActiveJinjaTemplate(); jinja && !messages.empty())
-    return DumpPrompt(jinja->Render(messages, tools, options, error_msg, image_offsets));
+  if (const auto* jinja = ActiveJinjaTemplate(); jinja && !messages.empty()) {
+    auto rendered =
+        jinja->Render(messages, tools, options, error_msg, image_offsets);
+    // The image path encodes only the suffix after the stable prefix and
+    // requires it to start at a special token after every image. Use the
+    // last turn start (the generation prompt). Text prompts keep 0, which
+    // leaves cache lookups unrestricted as before.
+    if (rendered && stable_prefix_bytes != nullptr && image_offsets != nullptr &&
+        !image_offsets->empty()) {
+      const auto start = rendered->rfind("<|im_start|>");
+      *stable_prefix_bytes =
+          start != std::string::npos && start > image_offsets->back()
+              ? start
+              : rendered->size();
+    }
+    return DumpPrompt(std::move(rendered));
+  }
   if (messages.empty()) {
     if (error_msg != nullptr) {
       *error_msg = "No messages provided";
