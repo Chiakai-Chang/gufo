@@ -54,12 +54,9 @@ struct TextRunnerRamCacheOptions {
 struct TextRunnerDiskCacheOptions {
   static constexpr std::size_t kDefaultCapacityBytes =
       std::size_t{8} * 1024U * 1024U * 1024U;
-  static constexpr std::size_t kAutomaticStagingMaxBytes =
-      std::size_t{1} * 1024U * 1024U * 1024U;
   std::filesystem::path directory;
   std::size_t capacity_bytes{kDefaultCapacityBytes};
-  /// Zero selects 1/8 of available host RAM, capped at 1 GiB and
-  /// capacity_bytes.
+  /// Zero selects 1/8 of available host RAM, capped at capacity_bytes.
   std::size_t staging_capacity_bytes{0};
   /// Shared prefixes shorter than this are cheaper to prefill than to restore.
   std::size_t shared_prefix_min_tokens{128};
@@ -74,8 +71,14 @@ struct TextRunnerDiskCacheOptions {
   std::size_t min_checkpoint_step_tokens{2048};
 };
 
-/// Automatic snapshot budget: half the host RAM available after loading,
-/// after cgroup limits.
+/// MemAvailable from /proc/meminfo text minus CmaFree, in bytes. Free CMA
+/// pages count as available but only hold movable pages, not GPU
+/// allocations; the kernel's KHO scratch area can make that several GiB.
+/// Nullopt when MemAvailable is missing.
+[[nodiscard]] std::optional<std::uint64_t> MeminfoAvailableBytes(
+    std::string_view meminfo);
+/// Automatic snapshot budget: half the host RAM available after loading
+/// (excluding free CMA pages), after cgroup limits.
 [[nodiscard]] std::size_t HostSnapshotBudgetBytes();
 /// RAM always left to the OS and other processes by an explicit cache limit.
 inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
@@ -107,6 +110,7 @@ struct TextRunnerCapabilities {
   /// Zero means no physical-width limit.
   std::size_t batched_multi_token_decode_max_width{0};
   bool prefix_reuse{true};
+  bool in_pass_checkpoint{false};
 };
 
 /// Model-owned compatibility identity for restart-safe snapshots.
@@ -158,6 +162,7 @@ struct TextRunnerMeasuredResources {
 struct TextPrefillStep {
   std::size_t consumed_tokens{0};
   bool decode_ready{false};
+  double checkpoint_ms{0};
 };
 
 struct TextDecodeSelection {
@@ -261,6 +266,7 @@ public:
       const {
     return sampling::JsonConstraint::ToolFormat::kJson;
   }
+  /// Reuse a compiled grammar bound to this runner's vocabulary.
   [[nodiscard]] std::shared_ptr<const sampling::TokenConstraint> BindConstraint(
       std::shared_ptr<const sampling::JsonConstraint> grammar) const;
 
@@ -324,6 +330,19 @@ public:
   [[nodiscard]] virtual TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const = 0;
+  /// Returns a claim only when this chunk can capture the boundary and keep
+  /// prefilling beyond it. Admission happens before allocating checkpoint
+  /// state.
+  [[nodiscard]] virtual std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
+      std::size_t, std::size_t) const {
+    return std::nullopt;
+  }
+  [[nodiscard]] virtual TextPrefillStep PrefillThrough(
+      TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
+      std::size_t, std::size_t, std::unique_ptr<TextRunnerSnapshot>*) const {
+    throw std::logic_error("runner does not support in-pass checkpoints");
+  }
   [[nodiscard]] virtual TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const = 0;
   virtual void Advance(TextRunnerState& state, TextRunnerToken token) const = 0;
@@ -338,6 +357,13 @@ public:
   /// Retain a safe executed frontier when cancellation interrupts publication
   /// of a completed speculative block. Called with cancellation checks cleared.
   virtual void PrepareCancellation(TextRunnerState&) const {}
+  enum class DeviceProbeStatus { kUsable, kPending, kLost };
+  /// Submit or poll one private device probe without waiting. Called only by
+  /// the scheduler between work units. Pending work is reused, never queued
+  /// again.
+  [[nodiscard]] virtual DeviceProbeStatus PollDevice() const {
+    return DeviceProbeStatus::kUsable;
+  }
   /// Bounded check, run only after a failed work unit, that the execution
   /// device still accepts work. False means the context is permanently lost;
   /// a probe that is still pending at its bound reports true.
@@ -353,6 +379,11 @@ public:
   /// shared execution scratch; other sessions may execute concurrently.
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const;
+  /// Complete state before returning so export cannot introduce device copies
+  /// while the session resumes prefill. Defaults to the ordinary snapshot.
+  [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot>
+  SnapshotForPersistence(const TextRunnerState& state) const;
+
   virtual void RestoreOrFork(TextRunnerState& state,
                              const TextRunnerSnapshot& snapshot) const;
 
@@ -518,6 +549,13 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+/// Build output constraints and attach server-authored instructions as framing,
+/// preserving client message content and the model's native prompt layout.
+[[nodiscard]] std::optional<ChatRequest> ConstrainChatRequest(
+    const ChatRequest& request, const TextModelRunner& runner,
+    sampling::SamplingConfig* sampling,
+    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
 
 }  // namespace gufo::server
 

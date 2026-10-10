@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -106,6 +107,8 @@ struct ChatRequest {
   std::string client_id{"anonymous"};
   ToolChoice tool_choice{ToolChoice::kAuto};
   std::string forced_tool_name;
+  /// Responses namespace of each flattened function, echoed on its calls.
+  std::map<std::string, std::string> tool_namespaces;
   bool constrained_tools{false};
   bool parallel_tool_calls{true};
   ReasoningOptions reasoning;
@@ -140,6 +143,9 @@ public:
     std::int64_t time_ms{0};
   };
   using ProgressCallback = std::function<bool(const PromptProgress&)>;
+  /// Called at most once, before progress or output, when a streaming request
+  /// starts work or has waited in the queue for a bounded time.
+  using StartCallback = std::function<bool()>;
 
   /// One execution session for llama-server `/slots`. Idle sessions report
   /// zero counts rather than the previous request's.
@@ -254,9 +260,11 @@ public:
     GenerationRequest(GenerationRequest&&) = delete;
     GenerationRequest& operator=(GenerationRequest&&) = delete;
 
-    /// Streaming requests may report prompt progress before any token.
+    /// Streaming requests may report their start and prompt progress before
+    /// any token. Backends without a queue may never report the start.
     virtual Result Wait(const TokenCallback& on_token = {},
-                        const ProgressCallback& on_progress = {}) = 0;
+                        const ProgressCallback& on_progress = {},
+                        const StartCallback& on_start = {}) = 0;
     virtual void Cancel() noexcept = 0;
     /// Effective constrained tool format, including any schema fallback.
     /// Available before Wait and stable for this admitted request. Backends
@@ -299,6 +307,9 @@ public:
   [[nodiscard]] virtual ReasoningOptions reasoning_defaults() const {
     return {};
   }
+  /// The loaded tokenizer's control tokens, or null when it owns none. The
+  /// parser treats a pipe-wrapped spelling as call framing only when this trie
+  /// knows it; every other lookalike stays literal argument data (#383).
   [[nodiscard]] virtual InitialOutputState initial_output_state(
       const ChatRequest&) const {
     return InitialOutputState::kAuto;
@@ -392,8 +403,8 @@ TextGenerationBackend::start_complete(
           client_id_(std::move(client_id)),
           stop_sequences_(std::move(stop_sequences)) {}
 
-    Result Wait(const TokenCallback& on_token,
-                const ProgressCallback&) override {
+    Result Wait(const TokenCallback& on_token, const ProgressCallback&,
+                const StartCallback&) override {
       if (waited_.exchange(true, std::memory_order_acq_rel))
         throw std::logic_error("generation request was already consumed");
       return backend_.complete(
@@ -443,8 +454,8 @@ TextGenerationBackend::start_chat(const ChatRequest& request,
           sampling_(sampling_config),
           external_cancellation_(std::move(external_cancellation)) {}
 
-    Result Wait(const TokenCallback& on_token,
-                const ProgressCallback&) override {
+    Result Wait(const TokenCallback& on_token, const ProgressCallback&,
+                const StartCallback&) override {
       if (waited_.exchange(true, std::memory_order_acq_rel)) {
         throw std::logic_error("generation request was already consumed");
       }
