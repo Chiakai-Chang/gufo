@@ -1654,10 +1654,10 @@ void ParseQwenCalls(
     }
     // Calls to tools that are not in this request are kept, as llama-server
     // does (agent clients with deferred tools answer them). Schema mismatches
-    // are not dropped either; only an unfinished quotation, which is
-    // ambiguous, requires a declared call whose arguments satisfy its schema.
-    (void)require_schema;
-    if (complete && call_quotes.UnclosedAt(marker_begin)) {
+    // are not dropped either; only an ambiguous call (an unfinished quotation,
+    // or an implicit end of reasoning after one) requires a declared call
+    // whose arguments satisfy its schema.
+    if (complete && (require_schema || call_quotes.UnclosedAt(marker_begin))) {
       const auto tool =
           std::ranges::find(tools, call.name, &tokenization::ChatTool::name);
       if (tool == tools.end()) {

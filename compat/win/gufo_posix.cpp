@@ -18,6 +18,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <sys/utime.h>
 
 namespace {
@@ -368,11 +369,45 @@ int posix_fadvise(int fd, off_t offset, off_t len, int advice) {
   return 0;
 }
 
+// LockFileEx rejects directory handles, so flock on a directory locks the
+// sibling file "<directory>.gufo-lock" instead. One handle per directory is
+// kept for the process lifetime: locks from different handles conflict like
+// separate POSIX open file descriptions, and fd reuse cannot strand a lock.
+static HANDLE DirectoryLockHandle(HANDLE directory) {
+  std::vector<wchar_t> path(32768);
+  const DWORD length = GetFinalPathNameByHandleW(
+      directory, path.data(), static_cast<DWORD>(path.size()),
+      FILE_NAME_NORMALIZED);
+  if (length == 0 || length >= path.size())
+    return INVALID_HANDLE_VALUE;
+  const std::wstring lock_path = std::wstring(path.data(), length) + L".gufo-lock";
+  static std::mutex mutex;
+  static std::map<std::wstring, HANDLE> handles;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (const auto found = handles.find(lock_path); found != handles.end())
+    return found->second;
+  HANDLE h = CreateFileW(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h != INVALID_HANDLE_VALUE)
+    handles.emplace(lock_path, h);
+  return h;
+}
+
 int flock(int fd, int operation) {
   HANDLE h = FdHandle(fd);
   if (h == INVALID_HANDLE_VALUE) {
     errno = EBADF;
     return -1;
+  }
+  BY_HANDLE_FILE_INFORMATION info{};
+  if (GetFileInformationByHandle(h, &info) &&
+      (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+    h = DirectoryLockHandle(h);
+    if (h == INVALID_HANDLE_VALUE) {
+      SetErrnoFromWin32(GetLastError());
+      return -1;
+    }
   }
   OVERLAPPED ov{};
   if (operation & LOCK_UN) {

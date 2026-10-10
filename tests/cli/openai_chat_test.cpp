@@ -4184,8 +4184,9 @@ void TestNativeArgumentTypingMatrix() {
       }
     }
   }
-  // Parseable JSON and Python-literal recovery must both respect a known
-  // argument type. A malformed call must not invoke a tool with another type.
+  // Upstream drops a call whose value has the wrong declared type. This fork
+  // keeps it, as llama-server does: the client answers with a validation
+  // error the model can fix, whereas a dropped call left an empty reply.
   for (const auto& [type, raw] :
        std::vector<std::pair<std::string, std::string>>{{"integer", "true"},
                                                         {"integer", "True"},
@@ -4210,8 +4211,8 @@ void TestNativeArgumentTypingMatrix() {
     Expect(response.status == 200, "invalid native output is handled safely");
     const auto output = gufo::json::parse(response.body);
     const auto& message = *output.find("choices")->items()[0].find("message");
-    Expect(!message.find("tool_calls"),
-           "a value with the wrong declared type is not invoked");
+    Expect(message.find("tool_calls") != nullptr,
+           "a value with the wrong declared type is kept for the client");
   }
   // A declared name with surrounding spaces remains exact. llama.cpp's
   // JSON mapper trims it despite matching the exact key in its PEG grammar.
